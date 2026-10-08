@@ -119,9 +119,45 @@ The bottom-left of the title screen says which branch it took:
 | Title screen | Meaning |
 | --- | --- |
 | `audio: off` | `--no-audio` / `DREAMMALL_AUDIO=0`, or a headless mode |
-| `audio: no output device — playing silent` | quad-snd opened neither `default` nor `pipewire` |
-| `audio: forced on — device is dead` | you insisted with `DREAMMALL_AUDIO=1`; it is still not going to work |
+| `audio: <reason> — playing silent` | quad-snd's mixer thread died; reasons below |
+| `audio: forced on — <reason>` | you insisted with `DREAMMALL_AUDIO=1`; it is still not going to work |
 | `audio: on` | samples are leaving the process |
+
+The `<reason>` is quad-snd's failure, translated. They are different problems
+with different fixes, so they are no longer collapsed into one sentence — and
+one of them is *not* "you have no sound card":
+
+| Reason | What actually happened |
+| --- | --- |
+| `no output device` | `snd_pcm_open` failed on both `default` and `pipewire` |
+| `device refuses 32-bit float output` | quad-snd only ever asks for `FLOAT_LE`; a raw device that will not convert needs a `plug` layer in front of it |
+| `device rejected the buffer size` | quad-snd asks for exactly 4096 frames; `dmix` and some plugins say no |
+| `device rejected the buffer timing` | the same argument, over the period size |
+| `device rejected 44100 Hz` | the device will not run at that rate |
+| `device rejected stereo` | the device will not run with two channels |
+| `device never became ready` | the stream opened but never reached `PREPARED` |
+| `device rejected read-write access` | quad-snd opens `mmap` with `RW` access; some devices cannot serve it |
+| `device would not describe itself` | `snd_pcm_hw_params` was refused outright |
+| `device failed to start` | something unrecognised |
+
+Whichever it is, the same failure is printed once to stderr in the dependency's
+own words, with a file and line. That line is the thing to paste into a bug
+report; `DREAMMALL_AUDIO_VERBOSE=1` adds the panic backtrace.
+
+```text
+audio: quad-snd could not start — Can't open PCM device. (alsa_snd.rs:30)
+```
+
+A device that exists but refuses `FLOAT_LE` or the buffer size is an ALSA routing
+problem, not missing hardware. If `default` resolves straight to a raw device, a
+`plug` layer answers those questions on its behalf — but on a PulseAudio or
+PipeWire desktop `default` already converts, and this would bypass the mixer
+instead of helping it:
+
+```sh
+aplay -L | head -20    # what ALSA calls your devices, and whether default is a plug
+alsamixer              # ... and whether the channel is merely muted
+```
 
 If it reads `audio: on` and the room is still quiet, the problem is below the
 game. Two things worth knowing: the first note lands about 7 s after launch,

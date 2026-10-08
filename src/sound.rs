@@ -22,6 +22,7 @@
 
 use std::panic;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 use macroquad::audio::{self, Sound};
 
@@ -30,6 +31,14 @@ use crate::music::Music;
 /// Set when quad-snd's audio thread died at startup (see [`install_startup_guard`]).
 static AUDIO_THREAD_DIED: AtomicBool = AtomicBool::new(false);
 
+/// What quad-snd actually panicked about, e.g. `Can't open PCM device.`.
+///
+/// That thread fails in several distinct ways and they need different fixes: no
+/// card at all, a card that refuses `FLOAT_LE`, a buffer size `dmix` will not
+/// agree to. Calling all of them "no output device" sends people off hunting for
+/// hardware they already have.
+static AUDIO_FAILURE: Mutex<Option<String>> = Mutex::new(None);
+
 /// Has quad-snd's mixer thread gone? Set from the panic hook, on *its* thread,
 /// at whatever moment the device gives up — so it can only ever be read as
 /// "not yet", never as a promise about the next call.
@@ -37,11 +46,76 @@ fn died() -> bool {
     AUDIO_THREAD_DIED.load(Ordering::Relaxed)
 }
 
-/// What the title screen says once it has.
-const NO_DEVICE: &str = "audio: no output device — playing silent";
+/// quad-snd's own words, if it got as far as complaining.
+fn failure() -> Option<String> {
+    AUDIO_FAILURE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
 
-/// ... and what it says when the user insisted anyway.
-const FORCED_DEAD: &str = "audio: forced on — device is dead";
+/// quad-snd's panic strings, translated into something a player can act on.
+///
+/// The dependency's exact words, with file and line, go to stderr, where they
+/// can be pasted into a bug report; `alsa_snd.rs:30` under a title screen helps
+/// nobody. Each entry is a different failure with a different fix, which is the
+/// point: calling all of them "no output device" is what sent a player with
+/// working hardware off hunting for a sound card.
+const REASONS: &[(&str, &str)] = &[
+    ("open PCM", "no output device"),
+    ("FLOAT_LE", "device refuses 32-bit float output"),
+    ("buffer size", "device rejected the buffer size"),
+    // quad-snd's own spelling, not a typo to correct.
+    ("treshold", "device rejected the buffer timing"),
+    ("sample rate", "device rejected 44100 Hz"),
+    ("channels", "device rejected stereo"),
+    ("not ready", "device never became ready"),
+    ("access type", "device rejected read-write access"),
+    ("hw parameters", "device would not describe itself"),
+];
+
+/// The player-facing half of a failure. Note what an unrecognised reason does
+/// *not* claim: "no output device" was a guess, and stays one.
+fn short_reason(why: &str) -> &'static str {
+    REASONS
+        .iter()
+        .find(|(needle, _)| why.contains(needle))
+        .map(|(_, message)| *message)
+        .unwrap_or(if why.is_empty() {
+            "no output device"
+        } else {
+            "device failed to start"
+        })
+}
+
+/// The title screen line for a dead audio thread.
+fn audio_status(insisting: bool) -> String {
+    let short = short_reason(&failure().unwrap_or_default());
+    if insisting {
+        format!("audio: forced on — {short}")
+    } else {
+        format!("audio: {short} — playing silent")
+    }
+}
+
+/// The panic's message. Takes the payload directly rather than the hook-info
+/// type, which only answers to `PanicHookInfo` since 1.81 (before that,
+/// `PanicInfo`) and naming it would needlessly date the code.
+fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "failed to start".to_string()
+    }
+}
+
+/// Just the file name from a panic location's full path.
+fn file_name(path: &str) -> &str {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    name.rsplit('\\').next().unwrap_or(name)
+}
 
 /// Filter quad-snd's device-init panic out of the panic report.
 ///
@@ -72,6 +146,16 @@ pub fn install_startup_guard() {
         if benign {
             // Detection is not optional: `Sfx::boot` reads this flag to work out
             // whether the audio API is a corpse. Only the printing is gated.
+            let why = match info.location() {
+                Some(loc) => format!(
+                    "{} ({}:{})",
+                    panic_text(info.payload()),
+                    file_name(loc.file()),
+                    loc.line()
+                ),
+                None => panic_text(info.payload()),
+            };
+            *AUDIO_FAILURE.lock().unwrap_or_else(|p| p.into_inner()) = Some(why);
             AUDIO_THREAD_DIED.store(true, Ordering::Relaxed);
             if !verbose {
                 return;
@@ -128,6 +212,18 @@ impl Sfx {
         }
     }
 
+    /// Give up on audio, quoting quad-snd rather than guessing at its reasons.
+    fn gone(insisting: bool) -> Sfx {
+        if let Some(why) = failure() {
+            eprintln!("audio: quad-snd could not start — {why}");
+            eprintln!(
+                "       DREAMMALL_AUDIO_VERBOSE=1 prints the panic; --music \
+                 out.wav writes the soundtrack to a file instead"
+            );
+        }
+        Sfx::silent(&audio_status(insisting))
+    }
+
     /// Decide whether audio is possible, then load and start the soundtrack.
     pub async fn boot(wanted: AudioWanted, seed: u64) -> Sfx {
         let insisting = wanted == AudioWanted::Forced;
@@ -140,7 +236,7 @@ impl Sfx {
         // probing `snd_pcm_open` could only ever be wrong, and a wrong "no
         // device" mutes a machine that has one.
         if !insisting && died() {
-            return Sfx::silent(NO_DEVICE);
+            return Sfx::gone(insisting);
         }
 
         // Synthesise before handing anything to the audio API. The thread that
@@ -155,7 +251,7 @@ impl Sfx {
         // known about. Insisting has bought its look; from here the thread is
         // gone, and every further send is one more printed line for nobody.
         if died() {
-            return Sfx::silent(if insisting { FORCED_DEAD } else { NO_DEVICE });
+            return Sfx::gone(insisting);
         }
         let flight = render_music_wav(seed, true);
         let music_flight = load(&flight).await;
@@ -329,6 +425,52 @@ pub fn render_step_wav(pan: f32) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quad_snd_reasons_are_quoted_verbatim() {
+        // The two real quad-snd failures that need entirely different fixes must
+        // not collapse into the same sentence on the title screen.
+        let format = String::from("Can't set SND_PCM_FORMAT_FLOAT_LE format");
+        assert_eq!(panic_text(&format), "Can't set SND_PCM_FORMAT_FLOAT_LE format");
+        static OPEN: &str = "Can't open PCM device.";
+        assert_eq!(panic_text(&OPEN), "Can't open PCM device.");
+        // A panic payload that is neither kind of string still has to say
+        // something rather than nothing.
+        assert_eq!(panic_text(&42u32), "failed to start");
+    }
+
+    #[test]
+    fn panic_locations_are_reduced_to_a_file_and_line() {
+        assert_eq!(
+            file_name("/home/matt/.cargo/registry/src/quad-snd-0.2.8/src/alsa_snd.rs"),
+            "alsa_snd.rs"
+        );
+        assert_eq!(file_name("C:\\Users\\m\\quad-snd-0.2.8\\src\\alsa_snd.rs"), "alsa_snd.rs");
+        assert_eq!(file_name("alsa_snd.rs"), "alsa_snd.rs");
+    }
+
+    #[test]
+    fn each_device_failure_gets_its_own_sentence() {
+        // The bug this guards: every one of these used to read "no output
+        // device" on the title screen.
+        assert_eq!(short_reason("Can't open PCM device."), "no output device");
+        assert_eq!(
+            short_reason("Can't set SND_PCM_FORMAT_FLOAT_LE format"),
+            "device refuses 32-bit float output"
+        );
+        assert_eq!(
+            short_reason("Cant's set buffer size"),
+            "device rejected the buffer size"
+        );
+        // Matching the correctly-spelled word would find nothing.
+        assert_eq!(
+            short_reason("Cant's set treshold size"),
+            "device rejected the buffer timing"
+        );
+        // An unrecognised reason must not accuse anyone's hardware of being absent.
+        assert_eq!(short_reason("something new"), "device failed to start");
+        assert_eq!(short_reason(""), "no output device");
+    }
 
     #[test]
     fn only_quad_snd_panics_are_swallowed() {
