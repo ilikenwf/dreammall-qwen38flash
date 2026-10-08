@@ -117,6 +117,14 @@ async fn amain() {
         .and_then(|i| args.get(i + 1))
         .cloned();
 
+    // macroquad's `export_png` unwraps its own io error, so a missing output
+    // directory would otherwise surface as a panic about `IoError(NotFound)`
+    // partway through the run. Say which directory, before rendering anything.
+    if let Some(dir) = shot.as_deref() {
+        std::fs::create_dir_all(dir)
+            .unwrap_or_else(|e| panic!("--shot: cannot create {dir}: {e}"));
+    }
+
     let font_bytes = asset_bytes("assets/LiberationSans-Bold.ttf");
     let bold = macroquad::text::load_ttf_font_from_bytes(&font_bytes).expect("font");
 
