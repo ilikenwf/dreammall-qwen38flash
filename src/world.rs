@@ -11,7 +11,9 @@ pub struct MirrorDraw {
     pub mesh: Mesh,
     pub x: f32,
     pub z: f32,
-    pub facing_x: f32, // +1 faces +x, -1 faces -x
+    /// Unit surface normal; the reflection is taken across this vertical plane.
+    pub nx: f32,
+    pub nz: f32,
 }
 
 pub struct World {
@@ -167,25 +169,37 @@ impl World {
         // ---- mirrors ----
         let mut mirrors = Vec::new();
         for m in &layout.mirrors {
-            let hw = layout.section_at(m.z).half_w;
-            let (face_rot, facing_x) = if m.x < 0.0 {
-                (std::f32::consts::FRAC_PI_2, 1.0f32)
+            let sec = layout.section_at(m.z);
+            let hw = sec.half_w;
+            // Baked quads face +Z, so yaw the normal into place. atan2(nx, nz)
+            // maps (1,0)->+90°, (-1,0)->-90°, (0,-1)->180°, (0,1)->0°.
+            let face_rot = m.nx.atan2(m.nz);
+            // Side-wall mirrors snap flush to the wall; pier mirrors sit on the
+            // stub wall the layout sized for them.
+            let x = if m.nz == 0.0 {
+                m.x.signum() * (hw - 0.05)
             } else {
-                (-std::f32::consts::FRAC_PI_2, -1.0f32)
+                m.x
             };
-            let x = m.x.signum() * (hw - 0.05);
+            if m.pier > 0.0 {
+                props::add_mirror_pier(&mut g, x, m.z, m.pier, hw, sec.ceiling);
+            }
+            // Stand the glass proud of its own wall face; exactly coplanar with
+            // it just Z-fights into a muddy quad.
+            let z = m.z + m.nz * 0.03;
             let white = tex.white.weak_clone();
             mirrors.push(MirrorDraw {
                 mesh: baked_quad(
-                    sign_transform(x, m.y, m.z, m.w, m.h, face_rot, 0.0),
+                    sign_transform(x, m.y, z, m.w, m.h, face_rot, 0.0),
                     &white,
                     [1.0; 3],
                 ),
                 x,
-                z: m.z,
-                facing_x,
+                z,
+                nx: m.nx,
+                nz: m.nz,
             });
-            props::add_mirror_frame(&mut g, x, m.z, m.w, m.h, m.y);
+            props::add_mirror_frame(&mut g, x, z, m.w, m.h, m.y, m.nx, m.nz);
         }
 
         World {

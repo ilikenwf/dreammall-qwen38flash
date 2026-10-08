@@ -332,21 +332,37 @@ async fn amain() {
 
             // mirrors: render the sunset from the reflected camera, then the quad
             for (i, md) in world.mirrors.iter().enumerate() {
-                let dx = md.x - p.pos.x;
-                let dz = md.z - p.pos.z;
-                let dist2 = dx * dx + dz * dz;
-                if dist2 > 55.0 * 55.0 {
+                // Signed distance from the mirror plane along its normal: once
+                // it goes negative you have walked past it and there is nothing
+                // left to reflect.
+                let d = (p.pos.x - md.x) * md.nx + (p.pos.z - md.z) * md.nz;
+                if d < 0.0 {
                     continue;
                 }
-                let facing = vec3(md.facing_x, 0.0, 0.0);
-                if facing.dot(vec3(-dx, 0.0, -dz)) < 0.0 {
-                    continue; // player is behind the mirror plane
+                let dx = md.x - p.pos.x;
+                let dz = md.z - p.pos.z;
+                if dx * dx + dz * dz > 55.0 * 55.0 {
+                    continue;
                 }
+                let facing = vec3(md.nx, 0.0, md.nz);
                 let rt = &mirror_rts[i % mirror_rts.len()];
-                let mx = md.x;
-                let rpos = vec3(2.0 * mx - p.pos.x, p.pos.y, p.pos.z);
-                let rtarget =
-                    vec3(2.0 * mx - (p.pos.x + dir.x), p.pos.y + dir.y, p.pos.z + dir.z);
+                // Mirror the camera across the wall plane: P' = P - 2((P-M)·n)n.
+                // The eye and the look-at sit at different distances from the
+                // plane, so each needs its own signed distance; reusing the
+                // eye's for both points the reflected camera the wrong way and
+                // the sunset lands behind it — a black mirror.
+                let look = p.pos + dir;
+                let dl = (look.x - md.x) * md.nx + (look.z - md.z) * md.nz;
+                let rpos = vec3(
+                    p.pos.x - 2.0 * d * md.nx,
+                    p.pos.y,
+                    p.pos.z - 2.0 * d * md.nz,
+                );
+                let rtarget = vec3(
+                    look.x - 2.0 * dl * md.nx,
+                    look.y,
+                    look.z - 2.0 * dl * md.nz,
+                );
                 sunset.draw(time, rpos, rtarget, cam.fovy, facing, rt, &mats, &tex);
                 set_camera(&cam);
                 gl_use_material(&mats.mirror);
@@ -574,6 +590,23 @@ async fn amain() {
             shot_n += 1;
             use std::f32::consts::FRAC_PI_2;
             let f0 = game.layout.fountains[0];
+            // Prefer a corridor-facing pier mirror with room in front of it to
+            // stand in: the mall loops at z=0, so a mirror in the first section
+            // would put the camera outside the building.
+            let pier = game
+                .layout
+                .mirrors
+                .iter()
+                .find(|m| m.pier > 0.0 && m.z > 12.0 && m.z < LOOP_LEN - 12.0)
+                .copied()
+                .or_else(|| {
+                    game.layout
+                        .mirrors
+                        .iter()
+                        .find(|m| m.pier > 0.0)
+                        .copied()
+                        .or_else(|| game.layout.mirrors.first().copied())
+                });
             match shot_n {
                 6 => {
                     get_screen_data().export_png(&format!("{dir}/01_menu.png"));
@@ -592,20 +625,38 @@ async fn amain() {
                 }
                 26 => {
                     get_screen_data().export_png(&format!("{dir}/03_storefronts.png"));
-                    let m = game.layout.mirrors[0];
-                    game.player.pos = vec3(0.9, player::EYE, m.z);
-                    game.player.yaw = if m.x < 0.0 { -FRAC_PI_2 } else { FRAC_PI_2 };
+                    if let Some(m) = pier {
+                        // Back off along the normal and step toward the middle
+                        // of the corridor, so the stub wall reads as a solid
+                        // object rather than a rectangle pasted on a wall.
+                        let px = m.x + m.nx * 9.0 - m.x.signum() * 3.5;
+                        let pz = m.z + m.nz * 9.0;
+                        game.player.pos = vec3(px, player::EYE, pz);
+                        game.player.yaw = (m.x - px).atan2(m.z - pz);
+                        game.player.pitch = 0.0;
+                    }
                 }
                 36 => {
-                    get_screen_data().export_png(&format!("{dir}/04_mirror.png"));
+                    get_screen_data().export_png(&format!("{dir}/04_mirrors_context.png"));
+                    if let Some(m) = pier {
+                        // Right up in front of it, straight down the normal.
+                        game.player.pos =
+                            vec3(m.x + m.nx * 3.0, player::EYE, m.z + m.nz * 3.0);
+                        game.player.yaw = (-m.nx).atan2(-m.nz);
+                        game.player.pitch = 0.0;
+                    }
+                }
+                46 => {
+                    get_screen_data().export_png(&format!("{dir}/05_mirrors_closeup.png"));
                     game.phase = Phase::Flight;
                     game.player.flying = true;
+                    game.flight_left = game::FLIGHT_TIME * 0.6;
                     game.player.pos = vec3(f0.x, 5.5, f0.z - f0.hd - 4.0);
                     game.player.yaw = 0.0;
                     game.player.pitch = 0.25;
                 }
-                46 => {
-                    get_screen_data().export_png(&format!("{dir}/05_flight.png"));
+                56 => {
+                    get_screen_data().export_png(&format!("{dir}/06_flight.png"));
                     println!("SHOTS OK");
                     return;
                 }

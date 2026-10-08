@@ -61,6 +61,13 @@ pub struct Mirror {
     pub w: f32,
     pub h: f32,
     pub y: f32,
+    /// Unit surface normal. Side-wall mirrors are (±1, 0); a pier mirror that
+    /// faces back down the corridor at you is (0, -1).
+    pub nx: f32,
+    pub nz: f32,
+    /// 0.0 for a mirror hung flat on a wall; otherwise the depth of the stub
+    /// wall it is set into, which `world` has to build.
+    pub pier: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -323,12 +330,8 @@ impl Layout {
                     next_id += 1;
                     // small wall mirror between shops
                     if rng.chance(0.5) {
-                        l.mirrors.push(Mirror {                            x: if rng.chance(0.5) { -half_w + 0.08 } else { half_w - 0.08 },
-                            z: rng.range(z0 + 4.0, z1 - 4.0),                            w: 2.2,
-                            h: 3.4,
-                            y: 1.9,
-                        });
-                        next_id += 1;
+                        let side = if rng.chance(0.5) { -1.0 } else { 1.0 };
+                        l.wall_mirror(half_w, rng.range(z0 + 4.0, z1 - 4.0), 2.2, 3.4, 1.9, side);
                     }
                 }
                 SectionKind::Atrium => {
@@ -374,12 +377,8 @@ impl Layout {
                         l.push_prop(PropKind::Statue, rng.range(-7.0, 7.0), z0 + 2.5, &mut next_id, &mut rng);
                     }
                     // big mirror wall on one side
-                    l.mirrors.push(Mirror {                        x: if rng.chance(0.5) { -half_w + 0.1 } else { half_w - 0.1 },
-                        z: fz,                        w: 5.0,
-                        h: 4.2,
-                        y: 2.3,
-                    });
-                    next_id += 1;
+                    let side = if rng.chance(0.5) { -1.0 } else { 1.0 };
+                    l.wall_mirror(half_w, fz, 5.0, 4.2, 2.3, side);
                     l.signs.push(Sign { id: next_id,                        x: 0.0,
                         z: z0 + 0.4,
                         y: 4.6,                        w: 6.0,
@@ -425,12 +424,8 @@ impl Layout {
                     });
                     next_id += 1;
                     if rng.chance(0.5) {
-                        l.mirrors.push(Mirror {                            x: if rng.chance(0.5) { -half_w + 0.08 } else { half_w - 0.08 },
-                            z: rng.range(z0 + 3.0, z1 - 3.0),                            w: 2.2,
-                            h: 3.4,
-                            y: 1.9,
-                        });
-                        next_id += 1;
+                        let side = if rng.chance(0.5) { -1.0 } else { 1.0 };
+                        l.wall_mirror(half_w, rng.range(z0 + 3.0, z1 - 3.0), 2.2, 3.4, 1.9, side);
                     }
                 }
                 SectionKind::EscalatorHall => {
@@ -456,6 +451,17 @@ impl Layout {
                         l.push_prop(PropKind::Vending, half_w - 1.1, z0 + 2.5, &mut next_id, &mut rng);
                     }
                 }
+            }
+
+            // The mirrors above are all on side walls, which means you only
+            // ever glimpse them out of the corner of an eye and can never look
+            // back. These are set into stub walls that jut from a side wall and
+            // face straight back down the corridor, so they find you instead.
+            // Placed between shop bays so they never block a storefront.
+            if rng.chance(0.6) {
+                let side = if rng.chance(0.5) { -1.0 } else { 1.0 };
+                let bay = if rng.chance(0.5) { (7.3, 8.3) } else { (15.3, 16.3) };
+                l.pier_mirror(half_w, z0 + rng.range(bay.0, bay.1), side);
             }
         }
 
@@ -510,6 +516,52 @@ impl Layout {
         let my_id = p.id;
         self.props.push(p);
         my_id
+    }
+
+    /// A mirror hung flat on a side wall, facing across the corridor.
+    fn wall_mirror(&mut self, half_w: f32, z: f32, w: f32, h: f32, y: f32, side: f32) {
+        self.mirrors.push(Mirror {
+            x: side * (half_w - 0.08),
+            z,
+            w,
+            h,
+            y,
+            nx: -side,
+            nz: 0.0,
+            pier: 0.0,
+        });
+    }
+
+    /// A mirror set into a stub wall jutting from a side wall, facing back down
+    /// the corridor. Side-wall mirrors whiz past and you can never turn around,
+    /// so these are the ones you actually see yourself in.
+    fn pier_mirror(&mut self, half_w: f32, z: f32, side: f32) {
+        // The glass has to fit on the stub wall it is set into, frame included,
+        // or it floats off the edge into thin air.
+        let depth = 1.7;
+        let w = 1.3;
+        assert!(w / 2.0 + 0.15 <= depth / 2.0);
+        let (x0, x1) = if side < 0.0 {
+            (-half_w, -half_w + depth)
+        } else {
+            (half_w - depth, half_w)
+        };
+        self.mirrors.push(Mirror {
+            x: (x0 + x1) / 2.0,
+            z,
+            w,
+            h: 3.2,
+            y: 1.75,
+            nx: 0.0,
+            nz: -1.0,
+            pier: depth,
+        });
+        self.collision.push(Rect {
+            x0,
+            z0: z - 0.3,
+            x1,
+            z1: z + 0.8,
+        });
     }
 
     /// Layer the loop-k mutations. Win-critical objects (fountains, penny,
@@ -684,6 +736,56 @@ mod tests {
             assert!(!l.storefronts.is_empty());
             assert!(!l.signs.is_empty());
             assert!(l.props.iter().any(|p| p.kind == PropKind::Table));
+        }
+    }
+
+    #[test]
+    fn some_mirrors_face_you_down_the_corridor() {
+        // Side-wall mirrors were all there ever was, and since you can never
+        // turn around you never actually saw yourself in one.
+        for seed in [1u64, 42, 4242, 99999] {
+            let l = Layout::generate(seed, 0);
+            let facing: Vec<&Mirror> = l.mirrors.iter().filter(|m| m.nz < -0.5).collect();
+            assert!(
+                !facing.is_empty(),
+                "seed {seed}: no mirror faces the player as they walk forward"
+            );
+            for m in facing {
+                // It has to be standing on a stub wall, and fit inside the
+                // corridor it claims to be in.
+                assert!(m.pier > 0.0);
+                let hw = l.section_at(m.z).half_w;
+                // The pier is centred on x and reaches half its depth each way,
+                // so its outer face must land on (not through) the wall.
+                assert!(m.x.abs() + m.pier / 2.0 <= hw + 1e-3, "pier pokes through the wall");
+                assert!(m.x.abs() - m.pier / 2.0 > 0.0, "pier crosses the corridor centre");
+                assert!(m.w / 2.0 + 0.15 <= m.pier / 2.0 + 1e-3, "glass overhangs the pier");
+                assert!(m.z >= 0.0 && m.z < LOOP_LEN);
+            }
+            // Every normal stays unit and axis-aligned, or the reflection math
+            // in main.rs (a cheap axis flip) silently lies.
+            for m in &l.mirrors {
+                let len = (m.nx * m.nx + m.nz * m.nz).sqrt();
+                assert!((len - 1.0).abs() < 1e-6, "non-unit normal {:?}", (m.nx, m.nz));
+                assert!(m.nx == 0.0 || m.nz == 0.0, "mirror normal must be axis-aligned");
+            }
+        }
+    }
+
+    #[test]
+    fn pier_mirrors_never_block_the_exits() {
+        // Stub walls are obstacles; they must never sit on the penny, the
+        // hotdog, or a fountain, or the mall becomes unwinnable.
+        for seed in [3u64, 77, 2024] {
+            let l = Layout::generate(seed, 0);
+            for m in l.mirrors.iter().filter(|m| m.pier > 0.0) {
+                let near = |x: f32, z: f32| (m.x - x).abs() < m.pier + 1.0 && (m.z - z).abs() < 2.0;
+                assert!(!near(l.penny[0], l.penny[1]), "pier sits on the penny");
+                assert!(!near(l.hotdog[0], l.hotdog[1]), "pier sits on the hotdog");
+                for f in &l.fountains {
+                    assert!(!near(f.x, f.z), "pier sits on a fountain");
+                }
+            }
         }
     }
 

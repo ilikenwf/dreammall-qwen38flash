@@ -238,15 +238,36 @@ pub fn add_storefront(g: &mut Geom, sf: &Storefront, half_w: f32) {
     }
 }
 
-pub fn add_mirror_frame(g: &mut Geom, x: f32, z: f32, w: f32, h: f32, y: f32) {
-    let (z0, z1) = (z - w / 2.0 - 0.15, z + w / 2.0 + 0.15);
-    let face = x.abs();
-    // the frame box must stay BEHIND the mirror glass plane (glass sits at
-    // face-0.05); otherwise its front face hides the mirror entirely.
-    let (x0, x1) = if x < 0.0 { (-face - 0.18, -face - 0.01) } else { (face + 0.01, face + 0.18) };
-    g.box_aabb(Batch::Flat, x0, y - h / 2.0 - 0.15, z0, x1, y + h / 2.0 + 0.15, z1, [0.35, 0.3, 0.4]);
-    // little sconces
-    g.box_aabb(Batch::Emissive, x0, y + h / 2.0 + 0.2, z - 0.1, x1, y + h / 2.0 + 0.45, z + 0.1, [1.0, 0.9, 0.6]);
+pub fn add_mirror_frame(g: &mut Geom, x: f32, z: f32, w: f32, h: f32, y: f32, nx: f32, nz: f32) {
+    // The frame box has to stay BEHIND the glass plane (the glass sits exactly
+    // at x,z); if it pokes in front it hides the mirror entirely. `w` runs
+    // across the normal, so which axis it spans depends on which way it faces.
+    let (y0, y1) = (y - h / 2.0 - 0.15, y + h / 2.0 + 0.15);
+    let top = y + h / 2.0;
+    let across = w / 2.0 + 0.15;
+    if nx.abs() >= nz.abs() {
+        // side-wall mirror: spans z, thickness along x
+        let (a, b) = (x - nx * 0.01, x - nx * 0.18);
+        let (x0, x1) = (a.min(b), a.max(b));
+        g.box_aabb(Batch::Flat, x0, y0, z - across, x1, y1, z + across, [0.35, 0.3, 0.4]);
+        g.box_aabb(Batch::Emissive, x0, top + 0.2, z - 0.1, x1, top + 0.45, z + 0.1, [1.0, 0.9, 0.6]);
+    } else {
+        // end-on mirror: spans x, thickness along z
+        let (a, b) = (z - nz * 0.01, z - nz * 0.18);
+        let (z0, z1) = (a.min(b), a.max(b));
+        g.box_aabb(Batch::Flat, x - across, y0, z0, x + across, y1, z1, [0.35, 0.3, 0.4]);
+        g.box_aabb(Batch::Emissive, x - 0.1, top + 0.2, z0, x + 0.1, top + 0.45, z1, [1.0, 0.9, 0.6]);
+    }
+}
+
+/// The stub wall a pier mirror hangs on: a block jutting from a side wall into
+/// the corridor, with the glass on the face you walk up to. `z` is that front
+/// face, so the block grows away from you along +z.
+pub fn add_mirror_pier(g: &mut Geom, x: f32, z: f32, depth: f32, half_w: f32, ceiling: f32) {
+    let side = x.signum();
+    let (a, b) = (side * half_w, side * (half_w - depth));
+    let (x0, x1) = (a.min(b), a.max(b));
+    g.box_tex(Batch::Tex, x0, 0.0, z, x1, ceiling, z + 0.5, [0.95, 0.93, 0.9], 0.3);
 }
 
 pub fn add_hotdog(g: &mut Geom, x: f32, y: f32, z: f32) {
