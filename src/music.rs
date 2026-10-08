@@ -110,7 +110,9 @@ impl Music {
             detune: 1.0,
             flight: false,
             wobble: 0.0,
-            master: 0.42,
+            // Safe ceiling: `fill` multiplies a `tanh` by this, so the output can
+            // never exceed `master` no matter how many voices stack up.
+            master: 0.85,
         }
     }
 
@@ -312,19 +314,22 @@ impl Music {
             self.dpos = (self.dpos + 1) % dlen;
             l += d * 0.25;
             r += d * 0.25;
-            // dream lowpass
+            // The flight mix is the *bright* one: the same gentle dream smear as
+            // walking, a touch more top end so it cuts through, and the pitch
+            // wobble above. It used to sit at k≈0.02 — a one-pole corner near
+            // 140 Hz, which left nothing but bass and cost 12 dB against the
+            // walking mix, so the crossfade into flight just went quiet.
             let k = if self.flight {
-                0.02 + 0.015 * (time * 0.5).sin().abs()
+                0.55 + 0.1 * (time * 0.5).sin()
             } else {
                 0.35
             };
             self.lp_l += (l - self.lp_l) * k;
             self.lp_r += (r - self.lp_r) * k;
-            let (l, r) = if self.flight {
-                (self.lp_l, self.lp_r)
-            } else {
-                (l * 0.7 + self.lp_l * 0.3, r * 0.7 + self.lp_r * 0.3)
-            };
+            let (l, r) = (
+                l * 0.7 + self.lp_l * 0.3,
+                r * 0.7 + self.lp_r * 0.3,
+            );
             out[i * 2] = l.tanh() * self.master;
             out[i * 2 + 1] = r.tanh() * self.master;
         }
