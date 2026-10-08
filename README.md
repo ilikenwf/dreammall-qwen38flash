@@ -60,13 +60,13 @@ There is no backward. The mall is that kind of place.
   the seed; a second, brighter variant takes over during the flight.
 - `game.rs` — state machine: walking, penny/hotdog logic, the flight clock,
   loop-wrap, endings.
-- `sound.rs` — the soundtrack, and the device sniffing that keeps a machine with
-  no sound card silent instead of dead (see [Audio](#audio)).
+- `sound.rs` — the soundtrack, and the audio-thread bookkeeping that keeps a
+  machine with no sound card silent instead of dead (see [Audio](#audio)).
 
 ## Headless verification
 
 ```sh
-cargo test                      # 34 unit tests (layout, rng, music, sound, game)
+cargo test                      # 33 unit tests (layout, rng, music, sound, game)
 cargo run --release -- --smoke  # boots, simulates, prints SMOKE OK, exits
 cargo run --release -- --shot /tmp/shots --seed 4242  # 6 PNGs, SHOTS OK
 ```
@@ -88,11 +88,13 @@ enables it explicitly — without it every call is a silent no-op stub. With it 
 `quad-snd` spawns an ALSA thread during startup that panics outright if no PCM
 device can be opened, and then prints `Audio thread died` on every call, forever.
 
-So the game refuses to touch the audio API until it has found something to play
-through — an ALSA playback node under `/dev/snd`, or a PipeWire/Pulse socket —
-and it filters that one startup panic out of the report. A machine with no sound
-card gets one line on the title screen, `audio: no output device — playing
-silent`, and an otherwise identical, silent dream.
+So the game treats quad-snd's own failure as the diagnosis: that startup panic is
+swallowed and recorded as a flag, and `Sfx::boot` will not call into a dead audio
+thread. A machine with no sound card gets one line on the title screen,
+`audio: no output device — playing silent`, and an otherwise identical, silent
+dream. Nothing is probed or guessed first: a wrong "no device" mutes a machine
+that has one, and no amount of sniffing `/dev/snd` beats the backend actually
+reporting that it failed.
 
 libasound still prints its own `cannot find card '0'` errors, because macroquad
 builds its audio context before any game code runs and quad-snd tries to open a
@@ -105,9 +107,37 @@ does not compile on stable, so the game does not try.
 | Switch | Effect |
 | --- | --- |
 | `--no-audio` or `DREAMMALL_AUDIO=0` | force silence |
+| `DREAMMALL_AUDIO=1` | play anyway, even if the audio thread died — the title screen then reads `audio: forced on — device is dead`, and ALSA prints why |
 | `DREAMMALL_AUDIO_VERBOSE=1` | keep quad-snd's real panic report, for debugging audio |
 
 Linux needs `libasound` at runtime (already a dependency of the audio backend).
+
+## No sound?
+
+The bottom-left of the title screen says which branch it took:
+
+| Title screen | Meaning |
+| --- | --- |
+| `audio: off` | `--no-audio` / `DREAMMALL_AUDIO=0`, or a headless mode |
+| `audio: no output device — playing silent` | quad-snd opened neither `default` nor `pipewire` |
+| `audio: forced on — device is dead` | you insisted with `DREAMMALL_AUDIO=1`; it is still not going to work |
+| `audio: on` | samples are leaving the process |
+
+If it reads `audio: on` and the room is still quiet, the problem is below the
+game. Two things worth knowing: the first note lands about 7 s after launch,
+because both 64-second tracks are synthesised before the first frame, and the mix
+peaks near −7 dBFS, so a low volume setting can make it easy to miss.
+
+To hear the soundtrack with none of the game's audio path involved — no window,
+no device, no display — write it to a file:
+
+```sh
+./target/release/dreammall --music bgm.wav --seed 4242
+./target/release/dreammall --music flight.wav --seed 4242 --flight
+```
+
+64 seconds of 44.1 kHz stereo WAV, a pure function of the seed. If that file
+sounds fine and the game is quiet, the mall is not what is broken.
 
 ## Seeds
 

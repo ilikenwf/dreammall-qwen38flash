@@ -11,12 +11,14 @@
 //!    does during startup, before any of our code runs. Every later call then
 //!    prints `Audio thread died` forever.
 //!
-//! So [`install_startup_guard`] runs before macroquad boots and swallows that
-//! one benign panic, and [`Sfx::boot`] refuses to touch the audio API unless
-//! [`device_plausible`] finds something to play through — so a machine with no
-//! sound card never calls into the dead thread, never prints
-//! `Audio thread died`, shows one clear status line on the title screen, and
-//! plays a fully silent game. `--no-audio` forces silence anywhere.
+//! So [`install_startup_guard`] runs before macroquad boots, records that one
+//! benign panic as a flag, and [`Sfx::boot`] refuses to touch the audio API once
+//! the flag is set — a machine with no sound card never calls into the dead
+//! thread, never prints `Audio thread died`, shows one clear status line on the
+//! title screen, and plays a fully silent game. That flag is the entire
+//! diagnosis: nothing is probed or sniffed, because a wrong "no device" mutes a
+//! machine that has one. `--no-audio` forces silence; `DREAMMALL_AUDIO=1`
+//! insists anyway.
 
 use std::panic;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -44,10 +46,7 @@ static AUDIO_THREAD_DIED: AtomicBool = AtomicBool::new(false);
 /// `Audio thread died` spam are the parts that are ours to suppress.
 /// `DREAMMALL_AUDIO_VERBOSE=1` restores the real panic report.
 pub fn install_startup_guard() {
-    if std::env::var("DREAMMALL_AUDIO_VERBOSE").is_ok() {
-        return;
-    }
-
+    let verbose = std::env::var("DREAMMALL_AUDIO_VERBOSE").is_ok();
     let previous = panic::take_hook();
     // The closure's argument type is inferred rather than named on purpose:
     // `panic::PanicHookInfo` only exists under that name since 1.81 (it used to
@@ -58,8 +57,12 @@ pub fn install_startup_guard() {
             .map(|loc| from_quad_snd(loc.file()))
             .unwrap_or(false);
         if benign {
+            // Detection is not optional: `Sfx::boot` reads this flag to work out
+            // whether the audio API is a corpse. Only the printing is gated.
             AUDIO_THREAD_DIED.store(true, Ordering::Relaxed);
-            return;
+            if !verbose {
+                return;
+            }
         }
         previous(info);
     }));
@@ -73,57 +76,17 @@ fn from_quad_snd(file: &str) -> bool {
     file.contains("quad-snd")
 }
 
-/// Is there anything this machine could plausibly play audio through?
-///
-/// Deliberately does *not* call `snd_pcm_open`: every failed open makes
-/// libasound print nine lines of config errors to stderr, so asking that way
-/// would double the noise on exactly the machines that have no sound card.
-/// Look for what ALSA needs instead of opening it.
-///
-/// A false "yes" is cheap: quad-snd's thread panics, [`install_startup_guard`]
-/// notices, and [`Sfx::boot`] falls back to silence anyway. A false "no" would
-/// mute a working machine, so this answers "no" only when every route is
-/// missing — and quad-snd's sole Linux backend is ALSA, so these are all of
-/// the routes there are.
-#[cfg(target_os = "linux")]
-fn device_plausible() -> bool {
-    if std::env::var("PULSE_SERVER").is_ok() || std::env::var("PIPEWIRE_REMOTE").is_ok() {
-        return true;
-    }
-    // The node quad-snd ultimately opens.
-    if std::fs::read_dir("/dev/snd")
-        .map(|entries| {
-            entries
-                .flatten()
-                .any(|entry| is_playback_node(&entry.file_name().to_string_lossy()))
-        })
-        .unwrap_or(false)
-    {
-        return true;
-    }
-    // ... or a server that ALSA's `default` route forwards to.
-    match std::env::var("XDG_RUNTIME_DIR") {
-        Ok(dir) => {
-            std::path::Path::new(&format!("{dir}/pipewire-0")).exists()
-                || std::path::Path::new(&format!("{dir}/pulse/native")).exists()
-        }
-        Err(_) => false,
-    }
-}
-
-/// Is this `/dev/snd` entry something you can play through?
-///
-/// `pcmC0D0p` is playback; `pcmC0D0c` is capture, and `controlC0`, `timer` and
-/// `seq` are not streams at all.
-#[cfg(target_os = "linux")]
-fn is_playback_node(name: &str) -> bool {
-    name.starts_with("pcmC") && name.ends_with('p')
-}
-
-#[cfg(not(target_os = "linux"))]
-fn device_plausible() -> bool {
-    // Nothing portable to inspect; let macroquad try and fall back if it fails.
-    true
+/// What the command line asked for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum AudioWanted {
+    /// `--no-audio` or `DREAMMALL_AUDIO=0`: never touch the audio API.
+    Off,
+    /// Default: play unless quad-snd's audio thread died at startup.
+    Auto,
+    /// `DREAMMALL_AUDIO=1`: play even if the audio thread died. The escape
+    /// hatch for a device worth shouting at — insisting is the only way to
+    /// argue with the diagnosis.
+    Forced,
 }
 
 /// The dream's soundtrack. Silent by construction; `boot` decides otherwise.
@@ -153,22 +116,29 @@ impl Sfx {
     }
 
     /// Decide whether audio is possible, then load and start the soundtrack.
-    pub async fn boot(asked: bool, seed: u64) -> Sfx {
-        if !asked {
+    pub async fn boot(wanted: AudioWanted, seed: u64) -> Sfx {
+        if wanted == AudioWanted::Off {
             return Sfx::silent("audio: off");
         }
-        // Name the real cause: no plausible device at all, versus a device that
-        // quad-snd did try to bring up and could not (busy, permissions, ...).
-        if !device_plausible() {
+        // quad-snd's thread panics when it cannot open a device, and the hook in
+        // [`install_startup_guard`] turns that panic into a flag. That is direct
+        // evidence, so there is nothing to guess here: sniffing `/dev/snd` or
+        // probing `snd_pcm_open` could only ever be wrong, and a wrong "no
+        // device" mutes a machine that has one.
+        let dead = AUDIO_THREAD_DIED.load(Ordering::Relaxed);
+        if wanted != AudioWanted::Forced && dead {
             return Sfx::silent("audio: no output device — playing silent");
-        }
-        if AUDIO_THREAD_DIED.load(Ordering::Relaxed) {
-            return Sfx::silent("audio: device failed to start — playing silent");
         }
 
         let mut sfx = Sfx {
             live: true,
-            status: "audio: on".to_string(),
+            // Insisting on a dead device still insists — but the title screen
+            // says so instead of claiming sound that is not coming.
+            status: if dead {
+                "audio: forced on — device is dead".to_string()
+            } else {
+                "audio: on".to_string()
+            },
             music_normal: None,
             music_flight: None,
             step_l: None,
@@ -278,15 +248,16 @@ fn wav_bytes(pcm: &[u8], rate: u32, channels: u16) -> Vec<u8> {
     w
 }
 
+/// How long the soundtrack loop is, in seconds. Both the in-game loop and
+/// `--music` use this, so the number in the help text cannot drift.
+pub const MUSIC_SECONDS: usize = 64;
+
 /// Render the whole muzak loop to 16-bit PCM WAV bytes.
 pub fn render_music_wav(seed: u64, flight: bool) -> Vec<u8> {
     let rate = 44100.0f32;
-    let n = (rate * 64.0) as usize;
+    let n = (rate * MUSIC_SECONDS as f32) as usize;
     let mut m = Music::new(rate, seed);
     m.set_flight(flight);
-    if flight {
-        m.master *= 0.85;
-    }
     let mut out = Vec::with_capacity(n * 2);
     let mut block = vec![0.0f32; 2048 * 2];
     while out.len() < n * 2 {
@@ -312,18 +283,6 @@ pub fn render_step_wav(pan: f32) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn only_playback_nodes_count_as_an_output() {
-        assert!(is_playback_node("pcmC0D0p"));
-        assert!(is_playback_node("pcmC1D7p"));
-        // Capture streams, mixers, and timers cannot be played through.
-        assert!(!is_playback_node("pcmC0D0c"));
-        assert!(!is_playback_node("controlC0"));
-        assert!(!is_playback_node("timer"));
-        assert!(!is_playback_node("seq"));
-    }
 
     #[test]
     fn only_quad_snd_panics_are_swallowed() {
@@ -374,3 +333,4 @@ mod tests {
         assert_eq!(frames, vec![32000, -32000, 0]);
     }
 }
+

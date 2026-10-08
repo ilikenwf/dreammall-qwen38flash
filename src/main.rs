@@ -100,22 +100,80 @@ enum AppState {
 /// no sound card — so this stands in for `#[macroquad::main]`, which expands
 /// to exactly this call.
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+
+    // The soundtrack is a pure function of the seed, so it can leave the game
+    // entirely: no window, no audio device, no display. The quickest way to hear
+    // what the mall is playing on a machine the game cannot make noise on.
+    if let Some(path) = flag_value(&args, "--music") {
+        let flight = args.iter().any(|a| a == "--flight");
+        let seed = seed_from(&args);
+        let wav = sound::render_music_wav(seed, flight);
+        std::fs::write(&path, &wav).unwrap_or_else(|e| panic!("--music: cannot write {path}: {e}"));
+        println!(
+            "{} s of {} music, seed {seed}, {} KB -> {path}",
+            sound::MUSIC_SECONDS,
+            if flight { "flight" } else { "mall" },
+            wav.len() / 1024
+        );
+        return;
+    }
+
     sound::install_startup_guard();
     macroquad::Window::from_config(window_conf(), amain());
+}
+
+/// The value following a flag, as in `--seed 4242`.
+fn flag_value(args: &[String], flag: &str) -> Option<String> {
+    args.iter()
+        .position(|a| a == flag)
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+}
+
+/// `--seed <n>`, or something different on every run.
+fn seed_from(args: &[String]) -> u64 {
+    flag_value(args, "--seed")
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() ^ (d.subsec_nanos() as u64) << 32)
+                .unwrap_or(0xC0FFEE)
+        })
 }
 
 async fn amain() {
     let args: Vec<String> = std::env::args().collect();
     let smoke = args.iter().any(|a| a == "--smoke");
-    let no_audio = args.iter().any(|a| a == "--no-audio")
-        || std::env::var("DREAMMALL_AUDIO")
-            .map(|v| v == "0")
-            .unwrap_or(false);
     let shot: Option<String> = args
         .iter()
         .position(|a| a == "--shot")
         .and_then(|i| args.get(i + 1))
         .cloned();
+
+    // Three states, because both extremes have to be reachable: `device_plausible`
+    // is a heuristic, so a machine it cannot see needs a way to be played anyway.
+    let audio = if args.iter().any(|a| a == "--no-audio")
+        || std::env::var("DREAMMALL_AUDIO")
+            .map(|v| v == "0")
+            .unwrap_or(false)
+    {
+        sound::AudioWanted::Off
+    } else if std::env::var("DREAMMALL_AUDIO")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
+        sound::AudioWanted::Forced
+    } else {
+        sound::AudioWanted::Auto
+    };
+    // Headless modes must not open a device at all.
+    let audio = if smoke || shot.is_some() {
+        sound::AudioWanted::Off
+    } else {
+        audio
+    };
 
     // macroquad's `export_png` unwraps its own io error, so a missing output
     // directory would otherwise surface as a panic about `IoError(NotFound)`
@@ -132,17 +190,7 @@ async fn amain() {
     let mut tex = TexLib::new(bold.clone());
     let sunset = Sunset::new();
 
-    let seed = args
-        .iter()
-        .position(|a| a == "--seed")
-        .and_then(|i| args.get(i + 1))
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or_else(|| {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() ^ (d.subsec_nanos() as u64) << 32)
-                .unwrap_or(0xC0FFEE)
-        });
+    let seed = seed_from(&args);
 
     let mut game = Game::new(seed);
     let mut world = World::build(game.layout.clone(), &mut tex);
@@ -167,7 +215,7 @@ async fn amain() {
 
     // Audio probes for a genuinely openable device and stays silent if there
     // isn't one, so a headless/soundless box plays the dream in mute.
-    let mut sfx = Sfx::boot(!no_audio && !smoke && shot.is_none(), seed).await;
+    let mut sfx = Sfx::boot(audio, seed).await;
 
     let mut state = if smoke {
         AppState::Playing
