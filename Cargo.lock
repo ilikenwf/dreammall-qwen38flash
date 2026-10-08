@@ -106,7 +106,6 @@ name = "dreammall"
 version = "0.1.0"
 dependencies = [
  "macroquad",
- "quad-alsa-sys",
 ]
 
 [[package]]

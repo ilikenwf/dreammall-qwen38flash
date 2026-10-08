@@ -11,11 +11,12 @@
 //!    does during startup, before any of our code runs. Every later call then
 //!    prints `Audio thread died` forever.
 //!
-//! So [`install_startup_guard`] must run before macroquad boots (it hushes
-//! libasound and filters that one benign panic), and [`Sfx::boot`] asks ALSA to
-//! open exactly the devices quad-snd will try before touching the audio API.
-//! A machine with no sound card gets one clear status line on the title screen
-//! and a fully playable, silent game. `--no-audio` forces silence anywhere.
+//! So [`install_startup_guard`] runs before macroquad boots and swallows that
+//! one benign panic, and [`Sfx::boot`] refuses to touch the audio API unless
+//! [`device_plausible`] finds something to play through — so a machine with no
+//! sound card never calls into the dead thread, never prints
+//! `Audio thread died`, shows one clear status line on the title screen, and
+//! plays a fully silent game. `--no-audio` forces silence anywhere.
 
 use std::panic;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,33 +28,36 @@ use crate::music::Music;
 /// Set when quad-snd's audio thread died at startup (see [`install_startup_guard`]).
 static AUDIO_THREAD_DIED: AtomicBool = AtomicBool::new(false);
 
-/// Silence libasound's stderr spam and filter quad-snd's device-init panics.
+/// Filter quad-snd's device-init panic out of the panic report.
 ///
 /// Must be called **before** macroquad starts: macroquad builds its audio
 /// context during startup, and that is what spawns the ALSA thread that panics
-/// on a box with no sound card. Nothing inside the async main can run early
-/// enough to matter.
+/// on a box with no sound card. Nothing inside the async main runs early enough
+/// to matter.
+///
+/// This deliberately does *not* try to silence libasound's own
+/// `cannot find card '0'` chatter. The only handle on it is
+/// `snd_lib_error_set_handler`, whose callback is C-variadic, and declaring a
+/// variadic `extern "C"` fn is unstable Rust (feature `c_variadic`, rust#44930)
+/// — it does not compile on stable. That chatter is what every native ALSA
+/// program prints on a machine with no sound card; the panic and the
+/// `Audio thread died` spam are the parts that are ours to suppress.
+/// `DREAMMALL_AUDIO_VERBOSE=1` restores the real panic report.
 pub fn install_startup_guard() {
-    // Escape hatch for anyone debugging audio: keep libasound's chatter and the
-    // real panic report.
-    let verbose = std::env::var("DREAMMALL_AUDIO_VERBOSE").is_ok();
-
-    #[cfg(target_os = "linux")]
-    if !verbose {
-        unsafe {
-            // A NULL handler here means "restore ALSA's default", which prints
-            // to stderr — so hand it an actual no-op to get silence.
-            quad_alsa_sys::snd_lib_error_set_handler(Some(silence_alsa_errors));
-        }
-    }
-
-    if verbose {
+    if std::env::var("DREAMMALL_AUDIO_VERBOSE").is_ok() {
         return;
     }
 
     let previous = panic::take_hook();
+    // The closure's argument type is inferred rather than named on purpose:
+    // `panic::PanicHookInfo` only exists under that name since 1.81 (it used to
+    // be `PanicInfo`), and spelling it here would needlessly date the code.
     panic::set_hook(Box::new(move |info| {
-        if is_audio_init_panic(info) {
+        let benign = info
+            .location()
+            .map(|loc| from_quad_snd(loc.file()))
+            .unwrap_or(false);
+        if benign {
             AUDIO_THREAD_DIED.store(true, Ordering::Relaxed);
             return;
         }
@@ -61,58 +65,64 @@ pub fn install_startup_guard() {
     }));
 }
 
-/// Swallows libasound's error chatter. Signature must match
-/// `snd_lib_error_handler_t` exactly, varargs included.
-#[cfg(target_os = "linux")]
-unsafe extern "C" fn silence_alsa_errors(
-    _file: *const std::os::raw::c_char,
-    _line: std::os::raw::c_int,
-    _func: *const std::os::raw::c_char,
-    _err: std::os::raw::c_int,
-    _fmt: *const std::os::raw::c_char,
-    _: ...,
-) {}
-
-/// Is this the panic quad-snd throws when the device is missing or unusable?
+/// Does this path belong to quad-snd, where every device-init panic lives?
 ///
-/// Matched by source file, so every other panic in the game still reports
-/// normally — we are hiding one known-benign message, not panics in general.
-fn is_audio_init_panic(info: &panic::PanicHookInfo) -> bool {
-    info.location()
-        .map(|loc| loc.file().contains("quad-snd"))
-        .unwrap_or(false)
+/// Matching on the file keeps every other panic in the game reporting
+/// normally — we hide one known-benign message, not panics in general.
+fn from_quad_snd(file: &str) -> bool {
+    file.contains("quad-snd")
 }
 
-/// Can an output device actually be opened right now?
+/// Is there anything this machine could plausibly play audio through?
 ///
-/// Opens (and immediately closes) exactly the devices quad-snd will try, in its
-/// order, so this answers yes only when quad-snd will also answer yes.
+/// Deliberately does *not* call `snd_pcm_open`: every failed open makes
+/// libasound print nine lines of config errors to stderr, so asking that way
+/// would double the noise on exactly the machines that have no sound card.
+/// Look for what ALSA needs instead of opening it.
+///
+/// A false "yes" is cheap: quad-snd's thread panics, [`install_startup_guard`]
+/// notices, and [`Sfx::boot`] falls back to silence anyway. A false "no" would
+/// mute a working machine, so this answers "no" only when every route is
+/// missing — and quad-snd's sole Linux backend is ALSA, so these are all of
+/// the routes there are.
 #[cfg(target_os = "linux")]
-fn device_openable() -> bool {
-    for name in ["default", "pipewire"] {
-        let Ok(cname) = std::ffi::CString::new(name) else {
-            continue;
-        };
-        unsafe {
-            let mut pcm: *mut quad_alsa_sys::snd_pcm_t = std::ptr::null_mut();
-            let opened = quad_alsa_sys::snd_pcm_open(
-                &mut pcm,
-                cname.as_ptr(),
-                quad_alsa_sys::SND_PCM_STREAM_PLAYBACK,
-                0,
-            ) >= 0;
-            if opened {
-                quad_alsa_sys::snd_pcm_close(pcm);
-                return true;
-            }
-        }
+fn device_plausible() -> bool {
+    if std::env::var("PULSE_SERVER").is_ok() || std::env::var("PIPEWIRE_REMOTE").is_ok() {
+        return true;
     }
-    false
+    // The node quad-snd ultimately opens.
+    if std::fs::read_dir("/dev/snd")
+        .map(|entries| {
+            entries
+                .flatten()
+                .any(|entry| is_playback_node(&entry.file_name().to_string_lossy()))
+        })
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    // ... or a server that ALSA's `default` route forwards to.
+    match std::env::var("XDG_RUNTIME_DIR") {
+        Ok(dir) => {
+            std::path::Path::new(&format!("{dir}/pipewire-0")).exists()
+                || std::path::Path::new(&format!("{dir}/pulse/native")).exists()
+        }
+        Err(_) => false,
+    }
+}
+
+/// Is this `/dev/snd` entry something you can play through?
+///
+/// `pcmC0D0p` is playback; `pcmC0D0c` is capture, and `controlC0`, `timer` and
+/// `seq` are not streams at all.
+#[cfg(target_os = "linux")]
+fn is_playback_node(name: &str) -> bool {
+    name.starts_with("pcmC") && name.ends_with('p')
 }
 
 #[cfg(not(target_os = "linux"))]
-fn device_openable() -> bool {
-    // No portable way to ask up front; let macroquad try.
+fn device_plausible() -> bool {
+    // Nothing portable to inspect; let macroquad try and fall back if it fails.
     true
 }
 
@@ -147,9 +157,9 @@ impl Sfx {
         if !asked {
             return Sfx::silent("audio: off");
         }
-        // Probe first: it names the real cause. A dead thread over an
-        // openable device means something else took the card (busy, perms).
-        if !device_openable() {
+        // Name the real cause: no plausible device at all, versus a device that
+        // quad-snd did try to bring up and could not (busy, permissions, ...).
+        if !device_plausible() {
             return Sfx::silent("audio: no output device — playing silent");
         }
         if AUDIO_THREAD_DIED.load(Ordering::Relaxed) {
@@ -189,16 +199,16 @@ impl Sfx {
 
     /// One footstep, panned left/right.
     pub fn footstep(&mut self, pan: f32) {
-        let Some(s) = (if pan < 0.0 { &self.step_l } else { &self.step_r }) else {
-            return;
-        };
-        audio::play_sound(
-            s,
-            audio::PlaySoundParams {
-                looped: false,
-                volume: 0.9,
-            },
-        );
+        let slot = if pan < 0.0 { &self.step_l } else { &self.step_r };
+        if let Some(s) = slot {
+            audio::play_sound(
+                s,
+                audio::PlaySoundParams {
+                    looped: false,
+                    volume: 0.9,
+                },
+            );
+        }
     }
 
     /// Crossfade normal muzak into the brighter flight theme.
@@ -302,6 +312,30 @@ pub fn render_step_wav(pan: f32) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn only_playback_nodes_count_as_an_output() {
+        assert!(is_playback_node("pcmC0D0p"));
+        assert!(is_playback_node("pcmC1D7p"));
+        // Capture streams, mixers, and timers cannot be played through.
+        assert!(!is_playback_node("pcmC0D0c"));
+        assert!(!is_playback_node("controlC0"));
+        assert!(!is_playback_node("timer"));
+        assert!(!is_playback_node("seq"));
+    }
+
+    #[test]
+    fn only_quad_snd_panics_are_swallowed() {
+        // The real path shape, as it appears in a panic location.
+        assert!(from_quad_snd(
+            "/home/matt/.cargo/registry/src/index.crates.io/quad-snd-0.2.8/src/alsa_snd.rs"
+        ));
+        // Everything else has to keep reporting normally.
+        assert!(!from_quad_snd("src/game.rs"));
+        assert!(!from_quad_snd("src/sound.rs"));
+        assert!(!from_quad_snd("/rust/deps/library/std/src/panicking.rs"));
+    }
 
     #[test]
     fn wav_header_is_well_formed() {

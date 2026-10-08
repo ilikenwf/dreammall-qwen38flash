@@ -60,13 +60,13 @@ There is no backward. The mall is that kind of place.
   the seed; a second, brighter variant takes over during the flight.
 - `game.rs` — state machine: walking, penny/hotdog logic, the flight clock,
   loop-wrap, endings.
-- `sound.rs` — the soundtrack, and the ALSA probing that keeps a machine with no
-  sound card silent instead of dead (see [Audio](#audio)).
+- `sound.rs` — the soundtrack, and the device sniffing that keeps a machine with
+  no sound card silent instead of dead (see [Audio](#audio)).
 
 ## Headless verification
 
 ```sh
-cargo test                      # 32 unit tests (layout, rng, music, sound, game)
+cargo test                      # 34 unit tests (layout, rng, music, sound, game)
 cargo run --release -- --smoke  # boots, simulates, prints SMOKE OK, exits
 cargo run --release -- --shot /tmp/shots --seed 4242  # 6 PNGs, SHOTS OK
 ```
@@ -87,15 +87,25 @@ macroquad 0.4.16 ships `audio` as a **non-default** feature, so `Cargo.toml`
 enables it explicitly — without it every call is a silent no-op stub. With it on,
 `quad-snd` spawns an ALSA thread during startup that panics outright if no PCM
 device can be opened, and then prints `Audio thread died` on every call, forever.
-So the game asks ALSA first, for exactly the devices quad-snd is going to try, and
-only touches the audio API if one really opens. A machine with no sound card gets
-one line on the title screen — `audio: no output device — playing silent` — and an
-otherwise identical, silent dream.
+
+So the game refuses to touch the audio API until it has found something to play
+through — an ALSA playback node under `/dev/snd`, or a PipeWire/Pulse socket —
+and it filters that one startup panic out of the report. A machine with no sound
+card gets one line on the title screen, `audio: no output device — playing
+silent`, and an otherwise identical, silent dream.
+
+libasound still prints its own `cannot find card '0'` errors, because macroquad
+builds its audio context before any game code runs and quad-snd tries to open a
+device regardless. Nine lines, once, at startup — which is what every native
+ALSA program prints on such a box. The only API that could silence them,
+`snd_lib_error_set_handler`, takes a C-variadic callback, and declaring a
+variadic `extern "C"` fn is unstable Rust (feature `c_variadic`, rust#44930): it
+does not compile on stable, so the game does not try.
 
 | Switch | Effect |
 | --- | --- |
 | `--no-audio` or `DREAMMALL_AUDIO=0` | force silence |
-| `DREAMMALL_AUDIO_VERBOSE=1` | keep libasound's stderr chatter and real panic reports, for debugging audio |
+| `DREAMMALL_AUDIO_VERBOSE=1` | keep quad-snd's real panic report, for debugging audio |
 
 Linux needs `libasound` at runtime (already a dependency of the audio backend).
 
