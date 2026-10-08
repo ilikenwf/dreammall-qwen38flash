@@ -1,0 +1,12 @@
+[package]
+name = "dreammall"
+version = "0.1.0"
+edition = "2021"
+description = "DREAM MALL — a small procedurally generated 3D dream-sim (Phase 1)"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+macroquad = "=0.4.16"
+
+[profile.release]
+opt-level = 2
