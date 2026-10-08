@@ -80,38 +80,46 @@ LIBGL_ALWAYS_SOFTWARE=1 xvfb-run -s "-screen 0 1280x800x24" \
 
 ## Audio
 
-Sound is on by default and needs no assets: the whole soundtrack is synthesised
-into memory at boot, from the mall's seed.
+Sound is on by default and needs no assets: the soundtrack is generated at
+runtime by `src/music.rs`, from the mall's seed, and written straight to the
+device by `src/alsa.rs`.
 
-macroquad 0.4.16 ships `audio` as a **non-default** feature, so `Cargo.toml`
-enables it explicitly — without it every call is a silent no-op stub. With it on,
-`quad-snd` spawns an ALSA thread during startup that panics outright if no PCM
-device can be opened, and then prints `Audio thread died` on every call, forever.
+Nothing about the device is assumed. At startup the game tries `default`, then
+`pipewire`, then every playback stream it can find under `/proc/asound` — first
+through `plughw:`, ALSA's own conversion layer, then raw `hw:` — and asks each one
+which sample formats it has and which rate it will actually run at. Whatever it
+answers is the rate the synthesiser is built at, so a 48 kHz-only machine gets
+48 kHz music instead of a refusal, and there is no resampler anywhere because
+there is nothing to resample. The title screen says what was agreed:
 
-So the game treats quad-snd's own failure as the diagnosis: that startup panic is
-swallowed and recorded as a flag, and `Sfx::boot` will not call into a dead audio
-thread. A machine with no sound card gets one line on the title screen,
-`audio: no output device — playing silent`, and an otherwise identical, silent
-dream. Nothing is probed or guessed first: a wrong "no device" mutes a machine
-that has one, and no amount of sniffing `/dev/snd` beats the backend actually
-reporting that it failed.
+```text
+audio: on · plughw:0,0 @ 48000 Hz S16
+```
 
-libasound still prints its own `cannot find card '0'` errors, because macroquad
-builds its audio context before any game code runs and quad-snd tries to open a
-device regardless. Nine lines, once, at startup — which is what every native
-ALSA program prints on such a box. The only API that could silence them,
-`snd_lib_error_set_handler`, takes a C-variadic callback, and declaring a
-variadic `extern "C"` fn is unstable Rust (feature `c_variadic`, rust#44930): it
-does not compile on stable, so the game does not try.
+If nothing opens, it says why, in the device's own words, and prints every device
+it tried and what each one said to stderr once:
+
+```text
+audio: device advertises no sample rate — playing silent
+```
 
 | Switch | Effect |
 | --- | --- |
 | `--no-audio` or `DREAMMALL_AUDIO=0` | force silence |
-| `DREAMMALL_AUDIO=1` | play anyway, even if the audio thread died — the title screen then reads `audio: forced on — <reason>` |
-| `DREAMMALL_AUDIO_VERBOSE=1` | keep quad-snd's real panic report, for debugging audio |
+| `DREAMMALL_AUDIO=1` | print every device tried and what each said, on a normal launch |
 | `--audio-check` | open the device, print the whole diagnosis, exit |
 
-Linux needs `libasound` at runtime (already a dependency of the audio backend).
+`libasound` is linked directly, with `#[link(name = "asound")]`; nothing sits
+between the game and ALSA. macroquad's `audio` feature is deliberately off: it
+pulls in `quad-snd`, which opened `default`, demanded 44100 Hz / `FLOAT_LE` / a
+4096-frame buffer, and panicked on a thread nobody else could observe when any of
+that was refused.
+
+libasound still prints its own `cannot find card '0'` lines on a machine with no
+sound card, because that is what every native ALSA program prints there. The only
+API that could silence them, `snd_lib_error_set_handler`, takes a C-variadic
+callback, and declaring a variadic `extern "C"` fn is unstable Rust (feature
+`c_variadic`, rust#44930), so the game does not try.
 
 ## No sound?
 
@@ -122,71 +130,57 @@ Start here. One command, one pasteable block, nothing to interpret:
 ```
 
 ```text
-quad-snd: Can't open PCM device. (alsa_snd.rs:30)
-title screen: audio: no output device — playing silent
+font: ./assets/LiberationSans-Bold.ttf (414568 bytes, fnv d0821eaeb9b16f0c)
+title screen: audio: on · default @ 44100 Hz F32
+tried:
+  default  → cannot open (No such file or directory)
+  pipewire → cannot open (No such file or directory)
+  plughw:0,0 → plughw:0,0 @ 48000 Hz S32
 $ aplay -l
-aplay: device_list:277: no sound cards found (-5)
+card 0: PCH [HDA Intel PCH], device 0: ALC892 Analog
 $ aplay -L
 default
 … 41 more
 ~/.asoundrc: absent
 /etc/asound.conf: absent
 $DREAMMALL_AUDIO: unset
-$DREAMMALL_AUDIO_VERBOSE: unset
 $ALSA_CARD: unset
 $DISPLAY: :1
-DREAMMALL_AUDIO_VERBOSE=1 --audio-check also prints the panic and backtrace.
 ```
 
-It forces the attempt — so a machine that gave up earlier still answers — then
-prints what quad-snd said, what ALSA believes exists, and which config files and
-environment variables are in play. That block is the thing to paste into a bug
-report; on a working device the first two lines read `no failure recorded` and
-`audio: on`.
+The `tried:` list is the whole story of a launch: every name, in the order they
+were attempted, with what each one said. A device further down working while
+`default` fails is normal and fine — that is the fallback doing its job. Paste the
+whole block into a bug report.
 
-The bottom-left of the title screen says which branch a normal launch took:
+The bottom-left of the title screen says which branch a launch took:
 
 | Title screen | Meaning |
 | --- | --- |
 | `audio: off` | `--no-audio` / `DREAMMALL_AUDIO=0`, or a headless mode |
-| `audio: <reason> — playing silent` | quad-snd's mixer thread died; reasons below |
-| `audio: forced on — <reason>` | you insisted with `DREAMMALL_AUDIO=1`; it is still not going to work |
-| `audio: on` | samples are leaving the process |
+| `audio: on · <device> @ <rate> Hz <format>` | samples are leaving the process, and that is what it agreed to |
+| `audio: <reason> — playing silent` | every candidate refused; the reason is below |
 
-The `<reason>` is quad-snd's failure, translated. Every panic the audio backend
-can produce is here — all thirteen, taken from the dependency's source and pinned
-by a test, because the first version of this table guessed at the wording and a
-real failure slipped straight through it:
+The reasons come from `src/alsa.rs`, so they name the parameter that was refused
+rather than guessing at hardware:
 
-| On screen | quad-snd's words | What it means |
-| --- | --- | --- |
-| `no output device` | `Can't open PCM device.` | `snd_pcm_open` failed on both `default` and `pipewire` |
-| `device refuses 32-bit float output` | `Can't set SND_PCM_FORMAT_FLOAT_LE format` | quad-snd only ever asks for `FLOAT_LE`; a raw device that will not convert needs a `plug` layer in front of it |
-| `device rejected the buffer size` | `Cant's set buffer size` | quad-snd asks for exactly 4096 frames; `dmix` and some plugins refuse |
-| `device advertises no sample rate` | `Can't set rate.` | `set_rate_near` rounds to the nearest supported rate, so failing at all means the device advertised *no* rate: a broken `route`/`dmix`/`plug` chain, not missing hardware |
-| `device rejected stereo` | `Can't set channels number.` | the device will not run with two channels |
-| `device rejected interleaved audio` | `Can't set interleaved mode` | the device will not do interleaved samples |
-| `device refused its own hardware settings` | `Can't set harware parameters.` | `snd_pcm_hw_params` was refused outright — the crate's spelling, not ours |
-| `device would not start playing` | `cannot prepare audio interface for use` | `snd_pcm_prepare` failed |
-| `device refused the start mode` | `cannot set start mode` | the software parameters were refused |
-| `device refused its playback settings` | `cannot … software parameters …` | allocating, initialising or setting `sw_params` failed |
-| `device never became ready` | `PCM device is not ready` | the stream opened but never reached `PREPARED` |
-| `device failed to start` | anything else | unrecognised — stderr has the exact panic |
+| Reason | What it means |
+| --- | --- |
+| `no output device` | every candidate failed to open at all — no card, or no permission on `/dev/snd` |
+| `cannot open (…)` | that one name is not a device; ALSA's own words are in brackets |
+| `device advertises no sample rate` | it opened but offered no rate whatsoever — a broken `route`/`dmix` chain |
+| `device would not describe itself` | `snd_pcm_hw_params_any` failed on an open stream |
+| `device will not do interleaved playback` | no `RW_INTERLEAVED` access |
+| `device will not do stereo` | it cannot run with two channels |
+| `device has no sample format we can produce` | none of `F32`, `S32`, `S16` |
+| `device refused the settings it just described` | `snd_pcm_hw_params` rejected the negotiated set |
+| `device would not start playing` | `snd_pcm_prepare` failed |
 
-Whichever it is, the same failure is printed once to stderr in the dependency's
-own words, with a file and line. That line is the thing to paste into a bug
-report; `DREAMMALL_AUDIO_VERBOSE=1` adds the panic backtrace.
-
-```text
-audio: quad-snd could not start — Can't open PCM device. (alsa_snd.rs:30)
-```
-
-Three of these — `FLOAT_LE`, the buffer size, and the rate — are a device that
-exists, works, and refuses one parameter. That is an ALSA routing problem, not
-missing hardware, and a `plug` layer in front of the device answers all three by
-converting on its behalf. Only do this if `default` points straight at a raw
-`hw:` device: on a PulseAudio or PipeWire desktop `default` already converts, and
-this would bypass the mixer instead of helping it.
+A device that exists but refuses one parameter is an ALSA routing problem, not
+missing hardware. The game already retries through `plughw:` for exactly that
+reason; if even that fails and `default` points straight at a raw `hw:` device, a
+`plug` layer answers on its behalf — but on a PulseAudio or PipeWire desktop
+`default` already converts, and this would bypass the mixer instead of helping:
 
 ```text
 pcm.!default {
@@ -203,15 +197,12 @@ alsamixer              # ... and whether the channel is merely muted
 ```
 
 If it reads `audio: on` and the room is still quiet, the problem is below the
-game. Two things worth knowing: the first note lands about 7 s after launch,
-because both 64-second tracks are synthesised before the first frame, and the mix
-peaks near −7 dBFS, so a low volume setting can make it easy to miss.
+game. The mix peaks near −7 dBFS, so a low volume setting is easy to mistake for
+silence; the first note lands on the first frame, since the soundtrack is
+generated as it plays rather than pre-rendered before the window appears.
 
-`Audio thread died` comes from quad-snd, once for every sound handed to a mixer
-thread that has already panicked. The game stops queueing the moment it notices
-the thread is gone, so a *stream* of them is a bug rather than a warning to
-ignore. A handful of libasound `cannot find card '0'` lines is not: that is ALSA
-itself, and every native ALSA program prints them on a machine with no sound card.
+A handful of libasound `cannot find card '0'` lines on a machine with no sound
+card is ALSA itself, not the game: every native ALSA program prints them there.
 
 To hear the soundtrack with none of the game's audio path involved — no window,
 no device, no display — write it to a file:

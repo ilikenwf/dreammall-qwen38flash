@@ -3,6 +3,7 @@
 //! You are trapped in a strange shopping mall, forced to keep walking forward.
 //! Somewhere there is a penny, and a fountain. Somewhere else there is a hotdog.
 
+mod alsa;
 mod game;
 mod geom;
 mod layout;
@@ -112,10 +113,9 @@ enum AppState {
     Won,
 }
 
-/// Real entry point. The guard has to run before macroquad builds its audio
-/// context — that is what spawns the ALSA thread that panics on a machine with
-/// no sound card — so this stands in for `#[macroquad::main]`, which expands
-/// to exactly this call.
+/// Real entry point, standing in for `#[macroquad::main]` — which expands to
+/// exactly this call — so that `--music` can write its WAV and leave before a
+/// window, a device or a display has been asked for.
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
@@ -136,7 +136,6 @@ fn main() {
         return;
     }
 
-    sound::install_startup_guard();
     macroquad::Window::from_config(window_conf(), amain());
 }
 
@@ -164,8 +163,7 @@ async fn amain() {
     let args: Vec<String> = std::env::args().collect();
 
     // `--audio-check`: open the device, describe what happened, leave. Every
-    // line it prints is a question that would otherwise be asked over chat, and
-    // it forces the attempt so a machine that gave up earlier still answers.
+    // line it prints is a question that would otherwise be asked over chat.
     if args.iter().any(|a| a == "--audio-check") {
         // Black squares where text should be means the font that loaded is not
         // the font that was written, so name the file that did.
@@ -177,8 +175,8 @@ async fn amain() {
             font.len(),
             fingerprint(&font)
         );
-        Sfx::boot(sound::AudioWanted::Forced, seed_from(&args)).await;
-        println!("{}", sound::report());
+        let sfx = Sfx::boot(sound::AudioWanted::Auto, seed_from(&args));
+        println!("{}", sfx.report());
         return;
     }
 
@@ -189,8 +187,8 @@ async fn amain() {
         .and_then(|i| args.get(i + 1))
         .cloned();
 
-    // Three states, because both extremes have to be reachable: `device_plausible`
-    // is a heuristic, so a machine it cannot see needs a way to be played anyway.
+    // Three states, because silence has to be reachable without a device, and
+    // the device list has to be reachable without a rebuild.
     let audio = if args.iter().any(|a| a == "--no-audio")
         || std::env::var("DREAMMALL_AUDIO")
             .map(|v| v == "0")
@@ -201,7 +199,7 @@ async fn amain() {
         .map(|v| v == "1")
         .unwrap_or(false)
     {
-        sound::AudioWanted::Forced
+        sound::AudioWanted::Verbose
     } else {
         sound::AudioWanted::Auto
     };
@@ -252,7 +250,7 @@ async fn amain() {
 
     // Audio probes for a genuinely openable device and stays silent if there
     // isn't one, so a headless/soundless box plays the dream in mute.
-    let mut sfx = Sfx::boot(audio, seed).await;
+    let mut sfx = Sfx::boot(audio, seed);
 
     let mut state = if smoke {
         AppState::Playing
@@ -373,7 +371,7 @@ async fn amain() {
         for pan in game.footfalls.drain(..) {
             sfx.footstep(pan);
         }
-        sfx.update(flying, dt);
+        sfx.update(flying);
 
         // ---------- render ----------
         let fog = if flying {

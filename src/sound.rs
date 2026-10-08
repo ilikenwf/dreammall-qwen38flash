@@ -1,210 +1,60 @@
-//! Audio: the procedural dream-music, footsteps, and the machinery that keeps
-//! a machine with no sound card *silent* rather than dead.
+//! Sound: the dream's soundtrack, generated at whatever rate the machine has.
 //!
-//! Two separate traps here, both real:
+//! There is no audio thread to die, no panic to filter, and no device to guess
+//! about. [`Sfx::boot`] asks ALSA for a stream ([`crate::alsa`]), learns the
+//! rate and format it actually got, and hands the device to one thread that runs
+//! the synthesiser at that rate for as long as the game lasts. Commands arrive
+//! over a channel; the thread stops when the handle goes quiet or the hardware
+//! stops answering.
 //!
-//! 1. macroquad 0.4.16 declares `default = []`, so `audio` is **not** a default
-//!    feature. Without it, `macroquad::audio` is a no-op stub that prints
-//!    `warn: macroquad's "audio" feature disabled.` and the game is mute.
-//! 2. Turn the feature on and quad-snd spawns an ALSA thread that *panics*
-//!    (`Can't open PCM device.`) when no PCM device opens — which macroquad
-//!    does during startup, before any of our code runs. Every later call then
-//!    prints `Audio thread died` forever.
-//!
-//! So [`install_startup_guard`] runs before macroquad boots, records that one
-//! benign panic as a flag, and [`Sfx::boot`] refuses to touch the audio API once
-//! the flag is set — a machine with no sound card never calls into the dead
-//! thread, never prints `Audio thread died`, shows one clear status line on the
-//! title screen, and plays a fully silent game. That flag is the entire
-//! diagnosis: nothing is probed or sniffed, because a wrong "no device" mutes a
-//! machine that has one. `--no-audio` forces silence; `DREAMMALL_AUDIO=1`
-//! insists anyway.
+//! The soundtrack used to be two 64-second WAVs, pre-rendered at 44100 Hz and
+//! crossfaded, because the previous backend could play nothing but buffers. The
+//! synthesiser was always continuous and always took a rate, so both the
+//! pre-render and the crossfade were the backend's limitation, not the game's.
 
-use std::panic;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 
-use macroquad::audio::{self, Sound};
-
+use crate::alsa::{self, Device};
 use crate::music::Music;
 
-/// Set when quad-snd's audio thread died at startup (see [`install_startup_guard`]).
-static AUDIO_THREAD_DIED: AtomicBool = AtomicBool::new(false);
+/// How long the `--music` export is, in seconds. The in-game soundtrack is
+/// generated continuously and has no length; this only bounds the WAV file.
+pub const MUSIC_SECONDS: usize = 64;
 
-/// What quad-snd actually panicked about, e.g. `Can't open PCM device.`.
-///
-/// That thread fails in several distinct ways and they need different fixes: no
-/// card at all, a card that refuses `FLOAT_LE`, a buffer size `dmix` will not
-/// agree to. Calling all of them "no output device" sends people off hunting for
-/// hardware they already have.
-static AUDIO_FAILURE: Mutex<Option<String>> = Mutex::new(None);
-
-/// Has quad-snd's mixer thread gone? Set from the panic hook, on *its* thread,
-/// at whatever moment the device gives up — so it can only ever be read as
-/// "not yet", never as a promise about the next call.
-fn died() -> bool {
-    AUDIO_THREAD_DIED.load(Ordering::Relaxed)
-}
-
-/// quad-snd's own words, if it got as far as complaining.
-fn failure() -> Option<String> {
-    AUDIO_FAILURE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone()
-}
-
-/// quad-snd's panic strings, translated into something a player can act on.
-///
-/// The dependency's exact words, with file and line, go to stderr, where they
-/// can be pasted into a bug report; `alsa_snd.rs:30` under a title screen helps
-/// nobody. Each entry is a different failure with a different fix, which is the
-/// point: calling all of them "no output device" is what sent a player with
-/// working hardware off hunting for a sound card.
-const REASONS: &[(&str, &str)] = &[
-    // Substrings of quad-snd 0.2.8's actual panic strings in alsa_snd.rs, all
-    // thirteen of which the test below pins. Guessing at this wording is how a
-    // real player's "Can't set rate." reached their screen as "device failed to
-    // start" — the one sentence that says nothing.
-    ("open PCM", "no output device"),
-    ("FLOAT_LE", "device refuses 32-bit float output"),
-    ("buffer size", "device rejected the buffer size"),
-    // `snd_pcm_hw_params_set_rate_near` rounds to the nearest supported rate, so
-    // failing at all means the device advertised no rate whatsoever: a broken
-    // route/dmix/plug chain, not a missing sound card.
-    ("set rate", "device advertises no sample rate"),
-    ("channels number", "device rejected stereo"),
-    ("interleaved mode", "device rejected interleaved audio"),
-    // The crate's own spelling; matching "hardware" finds nothing.
-    ("harware parameters", "device refused its own hardware settings"),
-    ("prepare audio interface", "device would not start playing"),
-    ("start mode", "device refused the start mode"),
-    ("software parameters", "device refused its playback settings"),
-    ("is not ready", "device never became ready"),
-];
-
-/// The player-facing half of a failure. Note what an unrecognised reason does
-/// *not* claim: "no output device" was a guess, and stays one.
-fn short_reason(why: &str) -> &'static str {
-    REASONS
-        .iter()
-        .find(|(needle, _)| why.contains(needle))
-        .map(|(_, message)| *message)
-        .unwrap_or(if why.is_empty() {
-            "no output device"
-        } else {
-            "device failed to start"
-        })
-}
-
-/// The title screen line for a dead audio thread.
-fn audio_status(insisting: bool) -> String {
-    let short = short_reason(&failure().unwrap_or_default());
-    if insisting {
-        format!("audio: forced on — {short}")
-    } else {
-        format!("audio: {short} — playing silent")
-    }
-}
-
-/// The panic's message. Takes the payload directly rather than the hook-info
-/// type, which only answers to `PanicHookInfo` since 1.81 (before that,
-/// `PanicInfo`) and naming it would needlessly date the code.
-fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
-    if let Some(s) = payload.downcast_ref::<&str>() {
-        (*s).to_string()
-    } else if let Some(s) = payload.downcast_ref::<String>() {
-        s.clone()
-    } else {
-        "failed to start".to_string()
-    }
-}
-
-/// Just the file name from a panic location's full path.
-fn file_name(path: &str) -> &str {
-    let name = path.rsplit('/').next().unwrap_or(path);
-    name.rsplit('\\').next().unwrap_or(name)
-}
-
-/// Filter quad-snd's device-init panic out of the panic report.
-///
-/// Must be called **before** macroquad starts: macroquad builds its audio
-/// context during startup, and that is what spawns the ALSA thread that panics
-/// on a box with no sound card. Nothing inside the async main runs early enough
-/// to matter.
-///
-/// This deliberately does *not* try to silence libasound's own
-/// `cannot find card '0'` chatter. The only handle on it is
-/// `snd_lib_error_set_handler`, whose callback is C-variadic, and declaring a
-/// variadic `extern "C"` fn is unstable Rust (feature `c_variadic`, rust#44930)
-/// — it does not compile on stable. That chatter is what every native ALSA
-/// program prints on a machine with no sound card; the panic and the
-/// `Audio thread died` spam are the parts that are ours to suppress.
-/// `DREAMMALL_AUDIO_VERBOSE=1` restores the real panic report.
-pub fn install_startup_guard() {
-    let verbose = std::env::var("DREAMMALL_AUDIO_VERBOSE").is_ok();
-    let previous = panic::take_hook();
-    // The closure's argument type is inferred rather than named on purpose:
-    // `panic::PanicHookInfo` only exists under that name since 1.81 (it used to
-    // be `PanicInfo`), and spelling it here would needlessly date the code.
-    panic::set_hook(Box::new(move |info| {
-        let benign = info
-            .location()
-            .map(|loc| from_quad_snd(loc.file()))
-            .unwrap_or(false);
-        if benign {
-            // Detection is not optional: `Sfx::boot` reads this flag to work out
-            // whether the audio API is a corpse. Only the printing is gated.
-            let why = match info.location() {
-                Some(loc) => format!(
-                    "{} ({}:{})",
-                    panic_text(info.payload()),
-                    file_name(loc.file()),
-                    loc.line()
-                ),
-                None => panic_text(info.payload()),
-            };
-            *AUDIO_FAILURE.lock().unwrap_or_else(|p| p.into_inner()) = Some(why);
-            AUDIO_THREAD_DIED.store(true, Ordering::Relaxed);
-            if !verbose {
-                return;
-            }
-        }
-        previous(info);
-    }));
-}
-
-/// Does this path belong to quad-snd, where every device-init panic lives?
-///
-/// Matching on the file keeps every other panic in the game reporting
-/// normally — we hide one known-benign message, not panics in general.
-fn from_quad_snd(file: &str) -> bool {
-    file.contains("quad-snd")
-}
-
-/// What the command line asked for.
+/// How the player feels about audio.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum AudioWanted {
     /// `--no-audio` or `DREAMMALL_AUDIO=0`: never touch the audio API.
     Off,
-    /// Default: play unless quad-snd's audio thread died at startup.
+    /// Default: open the first device that will take stereo PCM.
     Auto,
-    /// `DREAMMALL_AUDIO=1`: play even if the audio thread died. The escape
-    /// hatch for a device worth shouting at — insisting is the only way to
-    /// argue with the diagnosis.
-    Forced,
+    /// `DREAMMALL_AUDIO=1`: same attempt, but print every device tried and what
+    /// each one said. The escape hatch is information, not a second code path —
+    /// with negotiation there is nothing left to insist past.
+    Verbose,
+}
+
+/// What the mixer thread is told to do.
+enum Cmd {
+    Flight(bool),
+    Step(f32),
 }
 
 /// The dream's soundtrack. Silent by construction; `boot` decides otherwise.
 pub struct Sfx {
     live: bool,
     status: String,
-    music_normal: Option<Sound>,
-    music_flight: Option<Sound>,
-    step_l: Option<Sound>,
-    step_r: Option<Sound>,
-    flight_fade: f32,
+    tx: Option<Sender<Cmd>>,
+    thread: Option<JoinHandle<()>>,
+    /// Cleared by the mixer thread when the device stops answering, so the game
+    /// stops queueing sounds nobody is going to play.
+    alive: Arc<AtomicBool>,
     flying_now: bool,
+    /// Every device tried at startup, kept for `--audio-check`.
+    attempts: Mutex<Vec<(String, String)>>,
 }
 
 impl Sfx {
@@ -212,86 +62,67 @@ impl Sfx {
         Sfx {
             live: false,
             status: status.to_string(),
-            music_normal: None,
-            music_flight: None,
-            step_l: None,
-            step_r: None,
-            flight_fade: 0.0,
+            tx: None,
+            thread: None,
+            alive: Arc::new(AtomicBool::new(false)),
             flying_now: false,
+            attempts: Mutex::new(Vec::new()),
         }
     }
 
-    /// Give up on audio, quoting quad-snd rather than guessing at its reasons.
-    fn gone(insisting: bool) -> Sfx {
-        if let Some(why) = failure() {
-            eprintln!("audio: quad-snd could not start — {why}");
-            eprintln!(
-                "       DREAMMALL_AUDIO_VERBOSE=1 prints the panic; --music \
-                 out.wav writes the soundtrack to a file instead"
-            );
-        }
-        Sfx::silent(&audio_status(insisting))
-    }
-
-    /// Decide whether audio is possible, then load and start the soundtrack.
-    pub async fn boot(wanted: AudioWanted, seed: u64) -> Sfx {
-        let insisting = wanted == AudioWanted::Forced;
+    /// Decide whether audio is possible, then start the soundtrack.
+    ///
+    /// This blocks for the length of one device negotiation — milliseconds, and
+    /// it has to, because the rate the device agrees to is the rate the
+    /// synthesiser is built at.
+    pub fn boot(wanted: AudioWanted, seed: u64) -> Sfx {
         if wanted == AudioWanted::Off {
             return Sfx::silent("audio: off");
         }
-        // quad-snd's thread panics when it cannot open a device, and the hook in
-        // [`install_startup_guard`] turns that panic into a flag. That is direct
-        // evidence, so there is nothing to guess here: sniffing `/dev/snd` or
-        // probing `snd_pcm_open` could only ever be wrong, and a wrong "no
-        // device" mutes a machine that has one.
-        if !insisting && died() {
-            return Sfx::gone(insisting);
-        }
-
-        // Synthesise before handing anything to the audio API. The thread that
-        // owns the device is spawned during macroquad's startup and panics
-        // *asynchronously*, so the flag can be set at any moment — including one
-        // just after we read it. Synthesis takes seconds, which is the grace that
-        // thread needs to fail; each sound sent to a corpse instead prints a line
-        // of `Audio thread died` from inside quad-snd.
-        let normal = render_music_wav(seed, false);
-        let music_normal = load(&normal).await;
-        // One sound is now in flight — the earliest a dead thread can possibly be
-        // known about. Insisting has bought its look; from here the thread is
-        // gone, and every further send is one more printed line for nobody.
-        if died() {
-            return Sfx::gone(insisting);
-        }
-        let flight = render_music_wav(seed, true);
-        let music_flight = load(&flight).await;
-        let left = render_step_wav(-0.4);
-        let step_l = load(&left).await;
-        let right = render_step_wav(0.4);
-        let step_r = load(&right).await;
-
-        let sfx = Sfx {
-            live: true,
-            status: "audio: on".to_string(),
-            music_normal,
-            music_flight,
-            step_l,
-            step_r,
-            flight_fade: 0.0,
-            flying_now: false,
-        };
-        // Again: the thread can die in the gap between any two of these calls.
-        if sfx.talkable() {
-            if let Some(s) = &sfx.music_normal {
-                audio::play_sound(
-                    s,
-                    audio::PlaySoundParams {
-                        looped: true,
-                        volume: 1.0,
+        let verbose = wanted == AudioWanted::Verbose;
+        match alsa::open() {
+            Ok((device, attempts)) => {
+                if verbose {
+                    log(&attempts);
+                }
+                let summary = device.summary();
+                let (tx, rx) = mpsc::channel();
+                let alive = Arc::new(AtomicBool::new(true));
+                let flag = alive.clone();
+                let spawned = std::thread::Builder::new()
+                    .name("dreammall-audio".to_string())
+                    .spawn(move || mixer(device, seed, rx, flag));
+                // A failed spawn drops the closure, which drops the device,
+                // which drains and closes it. Nothing is left dangling.
+                match spawned {
+                    Ok(thread) => Sfx {
+                        live: true,
+                        status: format!("audio: on · {summary}"),
+                        tx: Some(tx),
+                        thread: Some(thread),
+                        alive,
+                        flying_now: false,
+                        attempts: Mutex::new(named(attempts)),
                     },
-                );
+                    Err(_) => Sfx::silent("audio: could not start the audio thread"),
+                }
+            }
+            Err(attempts) => {
+                // Always printed: this is the one moment the player cannot see
+                // what the machine did, and "no audio" without a reason is a
+                // dead end.
+                log(&attempts);
+                let status = format!("audio: {} — playing silent", verdict(&attempts));
+                Sfx::silent(&status).with_attempts(attempts)
             }
         }
-        sfx
+    }
+
+    fn with_attempts(self, attempts: Vec<alsa::Attempt>) -> Sfx {
+        if let Ok(mut held) = self.attempts.lock() {
+            *held = named(attempts);
+        }
+        self
     }
 
     /// Human-readable audio state, for the title screen.
@@ -299,151 +130,142 @@ impl Sfx {
         &self.status
     }
 
-    /// Whether it is still worth calling into the audio API. Once the mixer
-    /// thread is gone, every call buys another line of `Audio thread died` —
-    /// including a thread that outlived startup and died later, mid-game.
-    fn talkable(&self) -> bool {
-        self.live && !died()
-    }
-
-    /// One footstep, panned left/right.
-    pub fn footstep(&mut self, pan: f32) {
-        if !self.talkable() {
-            return;
-        }
-        let slot = if pan < 0.0 { &self.step_l } else { &self.step_r };
-        if let Some(s) = slot {
-            audio::play_sound(
-                s,
-                audio::PlaySoundParams {
-                    looped: false,
-                    volume: 0.9,
-                },
-            );
-        }
-    }
-
-    /// Crossfade normal muzak into the brighter flight theme.
-    pub fn update(&mut self, flying: bool, dt: f32) {
-        if !self.talkable() {
-            return;
-        }
-        if flying && !self.flying_now {
-            self.flying_now = true;
-            if let Some(s) = &self.music_flight {
-                audio::play_sound(
-                    s,
-                    audio::PlaySoundParams {
-                        looped: true,
-                        volume: 0.0,
-                    },
-                );
-            }
-        }
-        if flying {
-            self.flight_fade = (self.flight_fade + dt * 0.8).min(1.0);
-            if let Some(s) = &self.music_normal {
-                audio::set_sound_volume(s, 1.0 - self.flight_fade);
-            }
-            if let Some(s) = &self.music_flight {
-                audio::set_sound_volume(s, self.flight_fade);
-            }
-        }
-    }
-}
-
-/// Decode a sound — unless the mixer thread is already known to be gone.
-///
-/// The guard belongs here and not at each call site because this is the one
-/// place that hands data to quad-snd's thread, and every send to a corpse prints
-/// `Audio thread died` from inside the dependency. The thread can die between any
-/// two of the loads in [`Sfx::boot`], so the check has to be per-send.
-async fn load(bytes: &[u8]) -> Option<Sound> {
-    if died() {
-        return None;
-    }
-    audio::load_sound_from_bytes(bytes).await.ok()
-}
-
-// ---------------------------------------------------------------------------
-// Soundtrack synthesis. The whole score is rendered to WAV in memory at boot,
-// so the mall ships with no audio assets and the music is a pure function of
-// the seed.
-// ---------------------------------------------------------------------------
-
-fn pcm16(samples: &[f32]) -> Vec<u8> {
-    let mut pcm = Vec::with_capacity(samples.len() * 2);
-    for s in samples {
-        let v = (s.clamp(-1.0, 1.0) * 32000.0) as i16;
-        pcm.extend_from_slice(&v.to_le_bytes());
-    }
-    pcm
-}
-
-fn wav_bytes(pcm: &[u8], rate: u32, channels: u16) -> Vec<u8> {
-    let mut w = Vec::with_capacity(44 + pcm.len());
-    let len = 36 + pcm.len() as u32;
-    w.extend_from_slice(b"RIFF");
-    w.extend_from_slice(&len.to_le_bytes());
-    w.extend_from_slice(b"WAVEfmt ");
-    w.extend_from_slice(&16u32.to_le_bytes());
-    w.extend_from_slice(&1u16.to_le_bytes()); // PCM
-    w.extend_from_slice(&channels.to_le_bytes());
-    w.extend_from_slice(&rate.to_le_bytes());
-    w.extend_from_slice(&(rate * channels as u32 * 2).to_le_bytes());
-    w.extend_from_slice(&(channels * 2).to_le_bytes());
-    w.extend_from_slice(&16u16.to_le_bytes());
-    w.extend_from_slice(b"data");
-    w.extend_from_slice(&(pcm.len() as u32).to_le_bytes());
-    w.extend_from_slice(pcm);
-    w
-}
-
-/// The whole audio path, described, for `--audio-check`.
-///
-/// One pasteable block: what quad-snd actually said, and what ALSA believes
-/// exists. The title screen's one-line reason is only half the story — the other
-/// half is whether `default` resolves to anything at all, and only the machine
-/// running the game knows that. Reads the same process-global state the mixer
-/// does, which is why this is a free function and not a method on a sound handle.
-pub fn report() -> String {
-    let mut out = String::new();
-    match failure() {
-        Some(why) => out.push_str(&format!("quad-snd: {why}\n")),
-        None => out.push_str("quad-snd: no failure recorded\n"),
-    }
-    // What a *normal* launch would say; the check itself forces the attempt, so
-    // the status it leaves behind is the insisting variant.
-    let verdict = if died() {
-        audio_status(false)
-    } else {
-        "audio: on".to_string()
-    };
-    out.push_str(&format!("title screen: {verdict}\n"));
-    out.push_str(&format!("$ aplay -l\n{}\n", probe("aplay", &["-l"])));
-    out.push_str(&format!("$ aplay -L\n{}\n", probe("aplay", &["-L"])));
-    let home = std::env::var("HOME").unwrap_or_default();
-    for (label, path) in [
-        ("~/.asoundrc", format!("{home}/.asoundrc")),
-        ("/etc/asound.conf", "/etc/asound.conf".to_string()),
-    ] {
-        out.push_str(&format!(
-            "{label}: {}\n",
-            if std::path::Path::new(&path).exists() {
-                "present"
+    /// The whole audio path, described, for `--audio-check`: what was tried,
+    /// what each device said, what ALSA believes exists, and which config files
+    /// and environment variables are in play. One pasteable block.
+    pub fn report(&self) -> String {
+        let mut out = String::new();
+        out.push_str(&format!("title screen: {}\n", self.status));
+        if let Ok(held) = self.attempts.lock() {
+            if held.is_empty() {
+                out.push_str("tried: (nothing — audio is switched off)\n");
             } else {
-                "absent"
+                out.push_str("tried:\n");
+                let width = held.iter().map(|(n, _)| n.len()).max().unwrap_or(0);
+                for (name, outcome) in held.iter() {
+                    out.push_str(&format!("  {name:<width$} → {outcome}\n"));
+                }
             }
-        ));
+        }
+        out.push_str(&format!("$ aplay -l\n{}\n", probe("aplay", &["-l"])));
+        out.push_str(&format!("$ aplay -L\n{}\n", probe("aplay", &["-L"])));
+        let home = std::env::var("HOME").unwrap_or_default();
+        for (label, path) in [
+            ("~/.asoundrc", format!("{home}/.asoundrc")),
+            ("/etc/asound.conf", "/etc/asound.conf".to_string()),
+        ] {
+            out.push_str(&format!(
+                "{label}: {}\n",
+                if std::path::Path::new(&path).exists() {
+                    "present"
+                } else {
+                    "absent"
+                }
+            ));
+        }
+        for name in ["DREAMMALL_AUDIO", "ALSA_CARD", "DISPLAY"] {
+            out.push_str(&format!(
+                "${name}: {}\n",
+                std::env::var(name).unwrap_or_else(|_| "unset".to_string())
+            ));
+        }
+        out.push_str("DREAMMALL_AUDIO=1 prints the device list on a normal launch too.");
+        out
     }
-    for name in ["DREAMMALL_AUDIO", "DREAMMALL_AUDIO_VERBOSE", "ALSA_CARD", "DISPLAY"] {
-        out.push_str(&format!(
-            "${name}: {}\n",
-            std::env::var(name).unwrap_or_else(|_| "unset".to_string())
-        ));
+
+    /// Tell the soundtrack whether the player is flying.
+    pub fn update(&mut self, flying: bool) {
+        if !self.live || flying == self.flying_now {
+            return;
+        }
+        self.flying_now = flying;
+        self.send(Cmd::Flight(flying));
     }
-    out.push_str("DREAMMALL_AUDIO_VERBOSE=1 --audio-check also prints the panic and backtrace.");
-    out
+
+    /// One footstep, panned.
+    pub fn footstep(&mut self, pan: f32) {
+        if !self.live {
+            return;
+        }
+        self.send(Cmd::Step(pan));
+    }
+
+    fn send(&mut self, cmd: Cmd) {
+        if !self.alive.load(Ordering::Relaxed) {
+            self.live = false;
+            return;
+        }
+        if let Some(tx) = &self.tx {
+            if tx.send(cmd).is_err() {
+                self.live = false;
+            }
+        }
+    }
+}
+
+impl Drop for Sfx {
+    fn drop(&mut self) {
+        // Closing the channel is the shutdown signal; the thread finishes the
+        // block it is writing, drains the device, and returns.
+        self.tx = None;
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// The mixer: one synthesiser, one device, one clock.
+///
+/// `write` blocks until the hardware has taken the samples, so the loop needs no
+/// timer — the device pulls the music out of the synthesiser at exactly the rate
+/// it plays it, whatever rate that turned out to be.
+fn mixer(mut device: Device, seed: u64, rx: Receiver<Cmd>, alive: Arc<AtomicBool>) {
+    let mut music = Music::new(device.rate as f32, seed);
+    // 40 ms per block: short enough that a footstep lands on the next frame,
+    // long enough that the thread spends almost all its time inside ALSA.
+    let frames = (device.rate as usize / 25).max(64);
+    let mut block = vec![0.0f32; frames * 2];
+    loop {
+        match rx.try_recv() {
+            Ok(Cmd::Flight(flight)) => music.set_flight(flight),
+            Ok(Cmd::Step(pan)) => music.footstep(pan),
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => break,
+        }
+        music.fill(&mut block);
+        if device.write(&block).is_err() {
+            break;
+        }
+    }
+    alive.store(false, Ordering::Relaxed);
+}
+
+fn named(attempts: Vec<alsa::Attempt>) -> Vec<(String, String)> {
+    attempts.into_iter().map(|a| (a.name, a.outcome)).collect()
+}
+
+/// What to put on the title screen when nothing worked.
+///
+/// A device that could not be opened at all is a missing sound card; a device
+/// that opened and then refused a parameter is a configuration problem, and
+/// saying "no output device" about it is the lie that started this.
+fn verdict(attempts: &[alsa::Attempt]) -> String {
+    match attempts.first() {
+        None => "no output device".to_string(),
+        Some(first) => {
+            if attempts.iter().all(|a| a.outcome.starts_with("cannot open")) {
+                "no output device".to_string()
+            } else {
+                first.outcome.clone()
+            }
+        }
+    }
+}
+
+fn log(attempts: &[alsa::Attempt]) {
+    for a in attempts {
+        eprintln!("audio: {name} — {outcome}", name = a.name, outcome = a.outcome);
+    }
 }
 
 /// Runs a diagnostic command and keeps its first lines. A missing binary is an
@@ -469,10 +291,6 @@ fn probe(cmd: &str, args: &[&str]) -> String {
     }
 }
 
-/// How long the soundtrack loop is, in seconds. Both the in-game loop and
-/// `--music` use this, so the number in the help text cannot drift.
-pub const MUSIC_SECONDS: usize = 64;
-
 /// Render the whole muzak loop to 16-bit PCM WAV bytes.
 pub fn render_music_wav(seed: u64, flight: bool) -> Vec<u8> {
     let rate = 44100.0f32;
@@ -489,93 +307,93 @@ pub fn render_music_wav(seed: u64, flight: bool) -> Vec<u8> {
     wav_bytes(&pcm16(&out), 44100, 2)
 }
 
-pub fn render_step_wav(pan: f32) -> Vec<u8> {
-    let mut m = Music::new(44100.0, 99);
-    m.footstep(pan);
-    let mut out = Vec::new();
-    let mut block = vec![0.0f32; 2048 * 2];
-    for _ in 0..3 {
-        m.fill(&mut block);
-        out.extend_from_slice(&block);
+/// Interleaved stereo f32, clamped to i16 — clipping must never wrap.
+fn pcm16(samples: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(samples.len() * 2);
+    for s in samples {
+        let v = (s.clamp(-1.0, 1.0) * 32000.0) as i16;
+        out.extend_from_slice(&v.to_le_bytes());
     }
-    wav_bytes(&pcm16(&out), 44100, 2)
+    out
+}
+
+fn wav_bytes(pcm: &[u8], rate: u32, channels: u16) -> Vec<u8> {
+    let mut w = Vec::with_capacity(44 + pcm.len());
+    w.extend_from_slice(b"RIFF");
+    w.extend_from_slice(&((36 + pcm.len()) as u32).to_le_bytes());
+    w.extend_from_slice(b"WAVE");
+    w.extend_from_slice(b"fmt ");
+    w.extend_from_slice(&16u32.to_le_bytes());
+    w.extend_from_slice(&1u16.to_le_bytes());
+    w.extend_from_slice(&channels.to_le_bytes());
+    w.extend_from_slice(&rate.to_le_bytes());
+    w.extend_from_slice(&(rate * channels as u32 * 2).to_le_bytes());
+    w.extend_from_slice(&(channels * 2).to_le_bytes());
+    w.extend_from_slice(&16u16.to_le_bytes());
+    w.extend_from_slice(b"data");
+    w.extend_from_slice(&(pcm.len() as u32).to_le_bytes());
+    w.extend_from_slice(pcm);
+    w
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn quad_snd_reasons_are_quoted_verbatim() {
-        // The two real quad-snd failures that need entirely different fixes must
-        // not collapse into the same sentence on the title screen.
-        let format = String::from("Can't set SND_PCM_FORMAT_FLOAT_LE format");
-        assert_eq!(panic_text(&format), "Can't set SND_PCM_FORMAT_FLOAT_LE format");
-        static OPEN: &str = "Can't open PCM device.";
-        assert_eq!(panic_text(&OPEN), "Can't open PCM device.");
-        // A panic payload that is neither kind of string still has to say
-        // something rather than nothing.
-        assert_eq!(panic_text(&42u32), "failed to start");
+    fn attempt(name: &str, outcome: &str) -> alsa::Attempt {
+        alsa::Attempt { name: name.to_string(), outcome: outcome.to_string() }
     }
 
     #[test]
-    fn panic_locations_are_reduced_to_a_file_and_line() {
-        assert_eq!(
-            file_name("/home/matt/.cargo/registry/src/quad-snd-0.2.8/src/alsa_snd.rs"),
-            "alsa_snd.rs"
-        );
-        assert_eq!(file_name("C:\\Users\\m\\quad-snd-0.2.8\\src\\alsa_snd.rs"), "alsa_snd.rs");
-        assert_eq!(file_name("alsa_snd.rs"), "alsa_snd.rs");
-    }
-
-    #[test]
-    fn every_quad_snd_panic_has_a_sentence() {
-        // Verbatim from quad-snd 0.2.8, src/alsa_snd.rs. The contract: none of
-        // these may fall through to the generic message, because the generic
-        // message is the one that tells a player nothing.
-        const REAL: &[&str] = &[
-            "Can't open PCM device.",
-            "Can't set interleaved mode",
-            "Can't set SND_PCM_FORMAT_FLOAT_LE format",
-            "Cant's set buffer size",
-            "Can't set channels number.",
-            "Can't set rate.",
-            "Can't set harware parameters.",
-            "cannot allocate software parameters structure",
-            "cannot initialize software parameters structure",
-            "cannot set start mode",
-            "cannot set software parameters",
-            "cannot prepare audio interface for use",
-            "PCM device is not ready",
+    fn a_machine_with_no_cards_is_called_that() {
+        let attempts = vec![
+            attempt("default", "cannot open (No such file or directory)"),
+            attempt("pipewire", "cannot open (No such file or directory)"),
         ];
-        for why in REAL {
-            assert_ne!(short_reason(why), "device failed to start", "fell through: {why}");
-        }
-        // The report carries a location suffix; matching must survive it.
+        assert_eq!(verdict(&attempts), "no output device");
+    }
+
+    #[test]
+    fn a_refused_parameter_is_not_reported_as_a_missing_card() {
+        // The whole point: a device that exists and refuses one setting must
+        // name that setting, because "no output device" sends the player off
+        // hunting for hardware they already have.
+        let attempts = vec![
+            attempt("default", "device advertises no sample rate"),
+            attempt("pipewire", "cannot open (No such file or directory)"),
+        ];
         assert_eq!(
-            short_reason("Can't set rate. (alsa_snd.rs:57)"),
+            verdict(&attempts),
             "device advertises no sample rate"
         );
-        // An unrecognised reason must not accuse anyone's hardware of being absent.
-        assert_eq!(short_reason("something new"), "device failed to start");
-        assert_eq!(short_reason(""), "no output device");
     }
 
     #[test]
-    fn only_quad_snd_panics_are_swallowed() {
-        // The real path shape, as it appears in a panic location.
-        assert!(from_quad_snd(
-            "/home/matt/.cargo/registry/src/index.crates.io/quad-snd-0.2.8/src/alsa_snd.rs"
-        ));
-        // Everything else has to keep reporting normally.
-        assert!(!from_quad_snd("src/game.rs"));
-        assert!(!from_quad_snd("src/sound.rs"));
-        assert!(!from_quad_snd("/rust/deps/library/std/src/panicking.rs"));
+    fn nothing_tried_is_still_not_a_crash() {
+        assert_eq!(verdict(&[]), "no output device");
+    }
+
+    #[test]
+    fn silent_audio_never_claims_to_be_playing() {
+        let mut sfx = Sfx::silent("audio: off");
+        assert_eq!(sfx.status(), "audio: off");
+        assert!(!sfx.live);
+        // Neither of these may reach for a device that is not there.
+        sfx.update(true);
+        sfx.footstep(-0.4);
+        assert!(!sfx.live);
+    }
+
+    #[test]
+    fn switching_to_silent_clears_the_thread_flag() {
+        let sfx = Sfx::silent("audio: off");
+        assert!(!sfx.alive.load(Ordering::Relaxed));
+        assert!(sfx.thread.is_none());
     }
 
     #[test]
     fn wav_header_is_well_formed() {
-        let wav = render_step_wav(0.0);
+        let wav = render_music_wav(1, false);
         assert_eq!(&wav[0..4], b"RIFF");
         assert_eq!(&wav[8..12], b"WAVE");
         assert_eq!(&wav[12..16], b"fmt ");
@@ -610,4 +428,3 @@ mod tests {
         assert_eq!(frames, vec![32000, -32000, 0]);
     }
 }
-

@@ -6,9 +6,11 @@ description = "DREAM MALL — a small procedurally generated 3D dream-sim (Phase
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-# `audio` is NOT a default feature in macroquad 0.4.16 (it declares
-# `default = []`); without it macroquad::audio is a silent no-op stub.
-macroquad = { version = "=0.4.16", features = ["audio"] }
+# `audio` deliberately off: macroquad's audio feature pulls in quad-snd, which
+# opens `default`, demands 44100 Hz / FLOAT_LE / a 4096-frame buffer, and panics
+# on a private thread when any of that is refused. `src/alsa.rs` talks to
+# libasound directly and asks the device what it supports instead.
+macroquad = { version = "=0.4.16" }
 
 [profile.release]
 opt-level = 2
