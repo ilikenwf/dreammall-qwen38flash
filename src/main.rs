@@ -11,6 +11,7 @@ mod music;
 mod player;
 mod props;
 mod rng;
+mod sound;
 mod sunset;
 mod tex;
 mod util;
@@ -18,7 +19,6 @@ mod world;
 
 use std::path::PathBuf;
 
-use macroquad::audio::{self, Sound};
 use macroquad::prelude::*;
 use macroquad::texture::RenderTargetParams;
 use macroquad::ui::root_ui;
@@ -27,7 +27,7 @@ use game::{Game, Held, Phase};
 use geom::{baked_quad, Batch};
 use layout::LOOP_LEN;
 use mats::Mats;
-use music::Music;
+use sound::Sfx;
 use sunset::Sunset;
 use tex::TexLib;
 use world::World;
@@ -95,91 +95,22 @@ enum AppState {
     Won,
 }
 
-struct Audio {
-    music_normal: Option<Sound>,
-    music_flight: Option<Sound>,
-    step_l: Option<Sound>,
-    step_r: Option<Sound>,
-    flight_fade: f32,
-    flying_now: bool,
+/// Real entry point. The guard has to run before macroquad builds its audio
+/// context — that is what spawns the ALSA thread that panics on a machine with
+/// no sound card — so this stands in for `#[macroquad::main]`, which expands
+/// to exactly this call.
+fn main() {
+    sound::install_startup_guard();
+    macroquad::Window::from_config(window_conf(), amain());
 }
 
-impl Audio {
-    fn disabled() -> Audio {
-        Audio {
-            music_normal: None,
-            music_flight: None,
-            step_l: None,
-            step_r: None,
-            flight_fade: 0.0,
-            flying_now: false,
-        }
-    }
-}
-
-fn pcm16(samples: &[f32]) -> Vec<u8> {
-    let mut pcm = Vec::with_capacity(samples.len() * 2);
-    for s in samples {
-        let v = (s.clamp(-1.0, 1.0) * 32000.0) as i16;
-        pcm.extend_from_slice(&v.to_le_bytes());
-    }
-    pcm
-}
-
-fn wav_bytes(pcm: &[u8], rate: u32, channels: u16) -> Vec<u8> {
-    let mut w = Vec::with_capacity(44 + pcm.len());
-    let len = 36 + pcm.len() as u32;
-    w.extend_from_slice(b"RIFF");
-    w.extend_from_slice(&len.to_le_bytes());
-    w.extend_from_slice(b"WAVEfmt ");
-    w.extend_from_slice(&16u32.to_le_bytes());
-    w.extend_from_slice(&1u16.to_le_bytes()); // PCM
-    w.extend_from_slice(&channels.to_le_bytes());
-    w.extend_from_slice(&rate.to_le_bytes());
-    w.extend_from_slice(&(rate * channels as u32 * 2).to_le_bytes());
-    w.extend_from_slice(&(channels * 2).to_le_bytes());
-    w.extend_from_slice(&16u16.to_le_bytes());
-    w.extend_from_slice(b"data");
-    w.extend_from_slice(&(pcm.len() as u32).to_le_bytes());
-    w.extend_from_slice(pcm);
-    w
-}
-
-/// Render the whole muzak loop to 16-bit PCM WAV bytes.
-fn render_music_wav(seed: u64, flight: bool) -> Vec<u8> {
-    let rate = 44100.0f32;
-    let n = (rate * 64.0) as usize;
-    let mut m = Music::new(rate, seed);
-    m.set_flight(flight);
-    if flight {
-        m.master *= 0.85;
-    }
-    let mut out = Vec::with_capacity(n * 2);
-    let mut block = vec![0.0f32; 2048 * 2];
-    while out.len() < n * 2 {
-        m.fill(&mut block);
-        out.extend_from_slice(&block);
-    }
-    out.truncate(n * 2);
-    wav_bytes(&pcm16(&out), 44100, 2)
-}
-
-fn render_step_wav(pan: f32) -> Vec<u8> {
-    let mut m = Music::new(44100.0, 99);
-    m.footstep(pan);
-    let mut out = Vec::new();
-    let mut block = vec![0.0f32; 2048 * 2];
-    for _ in 0..3 {
-        m.fill(&mut block);
-        out.extend_from_slice(&block);
-    }
-    wav_bytes(&pcm16(&out), 44100, 2)
-}
-
-#[macroquad::main(window_conf)]
-async fn main() {
+async fn amain() {
     let args: Vec<String> = std::env::args().collect();
     let smoke = args.iter().any(|a| a == "--smoke");
+    let no_audio = args.iter().any(|a| a == "--no-audio")
+        || std::env::var("DREAMMALL_AUDIO")
+            .map(|v| v == "0")
+            .unwrap_or(false);
     let shot: Option<String> = args
         .iter()
         .position(|a| a == "--shot")
@@ -226,27 +157,9 @@ async fn main() {
 
     bind_mirrors(&mut world, &mirror_rts);
 
-    // audio
-    let mut audio = Audio::disabled();
-    if !smoke && shot.is_none() {
-        audio.music_normal = audio::load_sound_from_bytes(&render_music_wav(seed, false))
-            .await
-            .ok();
-        audio.music_flight = audio::load_sound_from_bytes(&render_music_wav(seed, true))
-            .await
-            .ok();
-        audio.step_l = audio::load_sound_from_bytes(&render_step_wav(-0.4)).await.ok();
-        audio.step_r = audio::load_sound_from_bytes(&render_step_wav(0.4)).await.ok();
-        if let Some(s) = &audio.music_normal {
-            audio::play_sound(
-                s,
-                audio::PlaySoundParams {
-                    looped: true,
-                    volume: 1.0,
-                },
-            );
-        }
-    }
+    // Audio probes for a genuinely openable device and stays silent if there
+    // isn't one, so a headless/soundless box plays the dream in mute.
+    let mut sfx = Sfx::boot(!no_audio && !smoke && shot.is_none(), seed).await;
 
     let mut state = if smoke {
         AppState::Playing
@@ -359,42 +272,12 @@ async fn main() {
             }
         }
 
-        // footstep sounds
-        while let Some(pan) = game.footfalls.pop() {
-            if let Some(s) = if pan < 0.0 { &audio.step_l } else { &audio.step_r } {
-                audio::play_sound(
-                    s,
-                    audio::PlaySoundParams {
-                        looped: false,
-                        volume: 0.9,
-                    },
-                );
-            }
-        }
-
-        // flight music crossfade
+        // footstep sounds + the flight-music crossfade
         let flying = game.phase == Phase::Flight;
-        if flying && !audio.flying_now {
-            audio.flying_now = true;
-            if let Some(s) = &audio.music_flight {
-                audio::play_sound(
-                    s,
-                    audio::PlaySoundParams {
-                        looped: true,
-                        volume: 0.0,
-                    },
-                );
-            }
+        for pan in game.footfalls.drain(..) {
+            sfx.footstep(pan);
         }
-        if flying {
-            audio.flight_fade = (audio.flight_fade + dt * 0.8).min(1.0);
-            if let Some(s) = &audio.music_normal {
-                audio::set_sound_volume(s, 1.0 - audio.flight_fade);
-            }
-            if let Some(s) = &audio.music_flight {
-                audio::set_sound_volume(s, audio.flight_fade);
-            }
-        }
+        sfx.update(flying, dt);
 
         // ---------- render ----------
         let fog = if flying {
@@ -601,13 +484,28 @@ async fn main() {
                     sh * 0.75,
                     tp(&bold, 18, Color::new(1.0, 1.0, 1.0, 0.8)),
                 );
-                let help2 = "you cannot walk backward. the mall is that kind of place.";
+                let help2 = "once flying: Space up · Ctrl down · dive into a fountain to wake";
                 let s5 = measure_text(help2, Some(&bold), 18, 1.0);
                 draw_text_ex(
                     help2,
                     (sw - s5.width) / 2.0,
                     sh * 0.75 + 26.0,
                     tp(&bold, 18, Color::new(1.0, 1.0, 1.0, 0.6)),
+                );
+                let help3 = "you cannot walk backward. the mall is that kind of place.";
+                let s6 = measure_text(help3, Some(&bold), 18, 1.0);
+                draw_text_ex(
+                    help3,
+                    (sw - s6.width) / 2.0,
+                    sh * 0.75 + 52.0,
+                    tp(&bold, 18, Color::new(1.0, 1.0, 1.0, 0.6)),
+                );
+                // Say out loud why the dream might be silent.
+                draw_text_ex(
+                    sfx.status(),
+                    20.0,
+                    sh - 18.0,
+                    tp(&bold, 14, Color::new(1.0, 1.0, 1.0, 0.45)),
                 );
             }
             AppState::Paused => {

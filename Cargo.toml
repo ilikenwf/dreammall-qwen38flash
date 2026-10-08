@@ -6,7 +6,15 @@ description = "DREAM MALL — a small procedurally generated 3D dream-sim (Phase
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-macroquad = "=0.4.16"
+# `audio` is NOT a default feature in macroquad 0.4.16 (it declares
+# `default = []`); without it macroquad::audio is a silent no-op stub.
+macroquad = { version = "=0.4.16", features = ["audio"] }
+
+# Linux only: lets `sound` ask ALSA whether a device is actually openable
+# before touching macroquad's audio API, so a machine with no sound card stays
+# silent instead of spamming "Audio thread died". Same crate quad-snd uses.
+[target.'cfg(target_os = "linux")'.dependencies]
+quad-alsa-sys = "0.3.2"
 
 [profile.release]
 opt-level = 2
