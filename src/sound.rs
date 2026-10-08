@@ -62,16 +62,25 @@ fn failure() -> Option<String> {
 /// point: calling all of them "no output device" is what sent a player with
 /// working hardware off hunting for a sound card.
 const REASONS: &[(&str, &str)] = &[
+    // Substrings of quad-snd 0.2.8's actual panic strings in alsa_snd.rs, all
+    // thirteen of which the test below pins. Guessing at this wording is how a
+    // real player's "Can't set rate." reached their screen as "device failed to
+    // start" — the one sentence that says nothing.
     ("open PCM", "no output device"),
     ("FLOAT_LE", "device refuses 32-bit float output"),
     ("buffer size", "device rejected the buffer size"),
-    // quad-snd's own spelling, not a typo to correct.
-    ("treshold", "device rejected the buffer timing"),
-    ("sample rate", "device rejected 44100 Hz"),
-    ("channels", "device rejected stereo"),
-    ("not ready", "device never became ready"),
-    ("access type", "device rejected read-write access"),
-    ("hw parameters", "device would not describe itself"),
+    // `snd_pcm_hw_params_set_rate_near` rounds to the nearest supported rate, so
+    // failing at all means the device advertised no rate whatsoever: a broken
+    // route/dmix/plug chain, not a missing sound card.
+    ("set rate", "device advertises no sample rate"),
+    ("channels number", "device rejected stereo"),
+    ("interleaved mode", "device rejected interleaved audio"),
+    // The crate's own spelling; matching "hardware" finds nothing.
+    ("harware parameters", "device refused its own hardware settings"),
+    ("prepare audio interface", "device would not start playing"),
+    ("start mode", "device refused the start mode"),
+    ("software parameters", "device refused its playback settings"),
+    ("is not ready", "device never became ready"),
 ];
 
 /// The player-facing half of a failure. Note what an unrecognised reason does
@@ -520,22 +529,32 @@ mod tests {
     }
 
     #[test]
-    fn each_device_failure_gets_its_own_sentence() {
-        // The bug this guards: every one of these used to read "no output
-        // device" on the title screen.
-        assert_eq!(short_reason("Can't open PCM device."), "no output device");
+    fn every_quad_snd_panic_has_a_sentence() {
+        // Verbatim from quad-snd 0.2.8, src/alsa_snd.rs. The contract: none of
+        // these may fall through to the generic message, because the generic
+        // message is the one that tells a player nothing.
+        const REAL: &[&str] = &[
+            "Can't open PCM device.",
+            "Can't set interleaved mode",
+            "Can't set SND_PCM_FORMAT_FLOAT_LE format",
+            "Cant's set buffer size",
+            "Can't set channels number.",
+            "Can't set rate.",
+            "Can't set harware parameters.",
+            "cannot allocate software parameters structure",
+            "cannot initialize software parameters structure",
+            "cannot set start mode",
+            "cannot set software parameters",
+            "cannot prepare audio interface for use",
+            "PCM device is not ready",
+        ];
+        for why in REAL {
+            assert_ne!(short_reason(why), "device failed to start", "fell through: {why}");
+        }
+        // The report carries a location suffix; matching must survive it.
         assert_eq!(
-            short_reason("Can't set SND_PCM_FORMAT_FLOAT_LE format"),
-            "device refuses 32-bit float output"
-        );
-        assert_eq!(
-            short_reason("Cant's set buffer size"),
-            "device rejected the buffer size"
-        );
-        // Matching the correctly-spelled word would find nothing.
-        assert_eq!(
-            short_reason("Cant's set treshold size"),
-            "device rejected the buffer timing"
+            short_reason("Can't set rate. (alsa_snd.rs:57)"),
+            "device advertises no sample rate"
         );
         // An unrecognised reason must not accuse anyone's hardware of being absent.
         assert_eq!(short_reason("something new"), "device failed to start");

@@ -68,7 +68,11 @@ fn tp(font: &Font, font_size: u16, color: Color) -> TextParams<'_> {
     }
 }
 
-fn asset_bytes(rel: &str) -> Vec<u8> {
+/// Where an asset actually came from. The search starts at the current
+/// directory, so a stray `assets/` beside wherever the game was launched wins
+/// over the one in the repository — exactly the kind of thing a title screen
+/// full of black squares looks like, and invisible from a stack trace.
+fn asset_path(rel: &str) -> PathBuf {
     let mut roots: Vec<PathBuf> = vec![PathBuf::from(".")];
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
@@ -78,13 +82,26 @@ fn asset_bytes(rel: &str) -> Vec<u8> {
         }
     }
     roots.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
-    for r in roots {
-        let p = r.join(rel);
-        if let Ok(b) = std::fs::read(&p) {
-            return b;
-        }
+    roots
+        .into_iter()
+        .map(|r| r.join(rel))
+        .find(|p| p.exists())
+        .unwrap_or_else(|| panic!("asset not found: {rel}"))
+}
+
+fn asset_bytes(rel: &str) -> Vec<u8> {
+    let path = asset_path(rel);
+    std::fs::read(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
+}
+
+/// FNV-1a, so two same-named font files can be told apart without a dependency.
+fn fingerprint(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
-    panic!("asset not found: {rel}");
+    h
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -150,6 +167,16 @@ async fn amain() {
     // line it prints is a question that would otherwise be asked over chat, and
     // it forces the attempt so a machine that gave up earlier still answers.
     if args.iter().any(|a| a == "--audio-check") {
+        // Black squares where text should be means the font that loaded is not
+        // the font that was written, so name the file that did.
+        let font_path = asset_path("assets/LiberationSans-Bold.ttf");
+        let font = std::fs::read(&font_path).unwrap_or_default();
+        println!(
+            "font: {} ({} bytes, fnv {:016x})",
+            font_path.display(),
+            font.len(),
+            fingerprint(&font)
+        );
         Sfx::boot(sound::AudioWanted::Forced, seed_from(&args)).await;
         println!("{}", sound::report());
         return;

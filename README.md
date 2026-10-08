@@ -153,22 +153,25 @@ The bottom-left of the title screen says which branch a normal launch took:
 | `audio: forced on — <reason>` | you insisted with `DREAMMALL_AUDIO=1`; it is still not going to work |
 | `audio: on` | samples are leaving the process |
 
-The `<reason>` is quad-snd's failure, translated. They are different problems
-with different fixes, so they are no longer collapsed into one sentence — and
-one of them is *not* "you have no sound card":
+The `<reason>` is quad-snd's failure, translated. Every panic the audio backend
+can produce is here — all thirteen, taken from the dependency's source and pinned
+by a test, because the first version of this table guessed at the wording and a
+real failure slipped straight through it:
 
-| Reason | What actually happened |
-| --- | --- |
-| `no output device` | `snd_pcm_open` failed on both `default` and `pipewire` |
-| `device refuses 32-bit float output` | quad-snd only ever asks for `FLOAT_LE`; a raw device that will not convert needs a `plug` layer in front of it |
-| `device rejected the buffer size` | quad-snd asks for exactly 4096 frames; `dmix` and some plugins say no |
-| `device rejected the buffer timing` | the same argument, over the period size |
-| `device rejected 44100 Hz` | the device will not run at that rate |
-| `device rejected stereo` | the device will not run with two channels |
-| `device never became ready` | the stream opened but never reached `PREPARED` |
-| `device rejected read-write access` | quad-snd opens `mmap` with `RW` access; some devices cannot serve it |
-| `device would not describe itself` | `snd_pcm_hw_params` was refused outright |
-| `device failed to start` | something unrecognised |
+| On screen | quad-snd's words | What it means |
+| --- | --- | --- |
+| `no output device` | `Can't open PCM device.` | `snd_pcm_open` failed on both `default` and `pipewire` |
+| `device refuses 32-bit float output` | `Can't set SND_PCM_FORMAT_FLOAT_LE format` | quad-snd only ever asks for `FLOAT_LE`; a raw device that will not convert needs a `plug` layer in front of it |
+| `device rejected the buffer size` | `Cant's set buffer size` | quad-snd asks for exactly 4096 frames; `dmix` and some plugins refuse |
+| `device advertises no sample rate` | `Can't set rate.` | `set_rate_near` rounds to the nearest supported rate, so failing at all means the device advertised *no* rate: a broken `route`/`dmix`/`plug` chain, not missing hardware |
+| `device rejected stereo` | `Can't set channels number.` | the device will not run with two channels |
+| `device rejected interleaved audio` | `Can't set interleaved mode` | the device will not do interleaved samples |
+| `device refused its own hardware settings` | `Can't set harware parameters.` | `snd_pcm_hw_params` was refused outright — the crate's spelling, not ours |
+| `device would not start playing` | `cannot prepare audio interface for use` | `snd_pcm_prepare` failed |
+| `device refused the start mode` | `cannot set start mode` | the software parameters were refused |
+| `device refused its playback settings` | `cannot … software parameters …` | allocating, initialising or setting `sw_params` failed |
+| `device never became ready` | `PCM device is not ready` | the stream opened but never reached `PREPARED` |
+| `device failed to start` | anything else | unrecognised — stderr has the exact panic |
 
 Whichever it is, the same failure is printed once to stderr in the dependency's
 own words, with a file and line. That line is the thing to paste into a bug
@@ -178,11 +181,21 @@ report; `DREAMMALL_AUDIO_VERBOSE=1` adds the panic backtrace.
 audio: quad-snd could not start — Can't open PCM device. (alsa_snd.rs:30)
 ```
 
-A device that exists but refuses `FLOAT_LE` or the buffer size is an ALSA routing
-problem, not missing hardware. If `default` resolves straight to a raw device, a
-`plug` layer answers those questions on its behalf — but on a PulseAudio or
-PipeWire desktop `default` already converts, and this would bypass the mixer
-instead of helping it:
+Three of these — `FLOAT_LE`, the buffer size, and the rate — are a device that
+exists, works, and refuses one parameter. That is an ALSA routing problem, not
+missing hardware, and a `plug` layer in front of the device answers all three by
+converting on its behalf. Only do this if `default` points straight at a raw
+`hw:` device: on a PulseAudio or PipeWire desktop `default` already converts, and
+this would bypass the mixer instead of helping it.
+
+```text
+pcm.!default {
+    type plug
+    slave.pcm "hw:0,0"
+}
+```
+
+To see which case you are in, without rebuilding anything:
 
 ```sh
 aplay -L | head -20    # what ALSA calls your devices, and whether default is a plug
