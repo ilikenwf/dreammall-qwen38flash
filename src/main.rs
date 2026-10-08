@@ -225,10 +225,13 @@ async fn amain() {
                             (is_key_down(KeyCode::W) || is_key_down(KeyCode::Up)) as i32;
                         let strafe =
                             (is_key_down(KeyCode::D) as i32) - (is_key_down(KeyCode::A) as i32);
-                        let up = (is_key_down(KeyCode::Space) as i32
-                            - is_key_down(KeyCode::LeftControl) as i32)
-                            as f32;
-                        game.update(fwd as f32, strafe as f32, up, dt);
+                        // Ctrl (either side) or C: the dream has more than one
+                        // way to ask for "down", and nobody finds LeftControl.
+                        let down = is_key_down(KeyCode::LeftControl)
+                            || is_key_down(KeyCode::RightControl)
+                            || is_key_down(KeyCode::C);
+                        let up = is_key_down(KeyCode::Space) as i32 - down as i32;
+                        game.update(fwd as f32, strafe as f32, up as f32, dt);
                         if is_key_pressed(KeyCode::E) {
                             game.interact();
                         }
@@ -417,6 +420,38 @@ async fn amain() {
                     Color::new(0.9, 0.4, 0.3, 0.9),
                 );
             }
+            if game.phase == Phase::Flight {
+                // How much hotdog is left in the tank.
+                let frac = game.flight_fraction();
+                let secs = game.flight_left.max(0.0).ceil() as i32;
+                let (r, g, b) = if game.fading() {
+                    (0.95, 0.35, 0.3)
+                } else {
+                    (0.55, 0.85, 0.95)
+                };
+                draw_rectangle(
+                    sw / 2.0 - 100.0,
+                    26.0,
+                    200.0,
+                    6.0,
+                    Color::new(0.0, 0.0, 0.0, 0.35),
+                );
+                draw_rectangle(
+                    sw / 2.0 - 100.0,
+                    26.0,
+                    200.0 * frac,
+                    6.0,
+                    Color::new(r, g, b, 0.9),
+                );
+                let label = format!("dream fuel — {secs}s");
+                let s = measure_text(&label, Some(&bold), 16, 1.0);
+                draw_text_ex(
+                    &label,
+                    (sw - s.width) / 2.0,
+                    54.0,
+                    tp(&bold, 16, Color::new(r, g, b, 0.9)),
+                );
+            }
             if game.loop_k > 0 {
                 draw_text_ex(
                     &format!("dream pass {n}", n = game.loop_k),
@@ -435,13 +470,13 @@ async fn amain() {
                 );
             }
             if flying {
-                draw_rectangle(
-                    0.0,
-                    0.0,
-                    sw,
-                    sh,
-                    Color::new(0.8, 0.2, 0.7, 0.06 + 0.03 * (time * 1.3).sin()),
-                );
+                let pulse = 0.06 + 0.03 * (time * 1.3).sin();
+                draw_rectangle(0.0, 0.0, sw, sh, Color::new(0.8, 0.2, 0.7, pulse));
+                if game.fading() {
+                    // The dream is letting go: bleed the whole frame red.
+                    let a = 0.10 + 0.09 * (time * 5.0).sin();
+                    draw_rectangle(0.0, 0.0, sw, sh, Color::new(0.7, 0.05, 0.1, a.max(0.0)));
+                }
             }
         }
 
