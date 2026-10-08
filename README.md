@@ -128,6 +128,12 @@ game. Two things worth knowing: the first note lands about 7 s after launch,
 because both 64-second tracks are synthesised before the first frame, and the mix
 peaks near −7 dBFS, so a low volume setting can make it easy to miss.
 
+`Audio thread died` comes from quad-snd, once for every sound handed to a mixer
+thread that has already panicked. The game stops queueing the moment it notices
+the thread is gone, so a *stream* of them is a bug rather than a warning to
+ignore. A handful of libasound `cannot find card '0'` lines is not: that is ALSA
+itself, and every native ALSA program prints them on a machine with no sound card.
+
 To hear the soundtrack with none of the game's audio path involved — no window,
 no device, no display — write it to a file:
 

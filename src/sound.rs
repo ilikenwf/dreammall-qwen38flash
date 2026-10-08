@@ -30,6 +30,19 @@ use crate::music::Music;
 /// Set when quad-snd's audio thread died at startup (see [`install_startup_guard`]).
 static AUDIO_THREAD_DIED: AtomicBool = AtomicBool::new(false);
 
+/// Has quad-snd's mixer thread gone? Set from the panic hook, on *its* thread,
+/// at whatever moment the device gives up — so it can only ever be read as
+/// "not yet", never as a promise about the next call.
+fn died() -> bool {
+    AUDIO_THREAD_DIED.load(Ordering::Relaxed)
+}
+
+/// What the title screen says once it has.
+const NO_DEVICE: &str = "audio: no output device — playing silent";
+
+/// ... and what it says when the user insisted anyway.
+const FORCED_DEAD: &str = "audio: forced on — device is dead";
+
 /// Filter quad-snd's device-init panic out of the panic report.
 ///
 /// Must be called **before** macroquad starts: macroquad builds its audio
@@ -117,6 +130,7 @@ impl Sfx {
 
     /// Decide whether audio is possible, then load and start the soundtrack.
     pub async fn boot(wanted: AudioWanted, seed: u64) -> Sfx {
+        let insisting = wanted == AudioWanted::Forced;
         if wanted == AudioWanted::Off {
             return Sfx::silent("audio: off");
         }
@@ -125,39 +139,52 @@ impl Sfx {
         // evidence, so there is nothing to guess here: sniffing `/dev/snd` or
         // probing `snd_pcm_open` could only ever be wrong, and a wrong "no
         // device" mutes a machine that has one.
-        let dead = AUDIO_THREAD_DIED.load(Ordering::Relaxed);
-        if wanted != AudioWanted::Forced && dead {
-            return Sfx::silent("audio: no output device — playing silent");
+        if !insisting && died() {
+            return Sfx::silent(NO_DEVICE);
         }
 
-        let mut sfx = Sfx {
+        // Synthesise before handing anything to the audio API. The thread that
+        // owns the device is spawned during macroquad's startup and panics
+        // *asynchronously*, so the flag can be set at any moment — including one
+        // just after we read it. Synthesis takes seconds, which is the grace that
+        // thread needs to fail; each sound sent to a corpse instead prints a line
+        // of `Audio thread died` from inside quad-snd.
+        let normal = render_music_wav(seed, false);
+        let music_normal = load(&normal).await;
+        // One sound is now in flight — the earliest a dead thread can possibly be
+        // known about. Insisting has bought its look; from here the thread is
+        // gone, and every further send is one more printed line for nobody.
+        if died() {
+            return Sfx::silent(if insisting { FORCED_DEAD } else { NO_DEVICE });
+        }
+        let flight = render_music_wav(seed, true);
+        let music_flight = load(&flight).await;
+        let left = render_step_wav(-0.4);
+        let step_l = load(&left).await;
+        let right = render_step_wav(0.4);
+        let step_r = load(&right).await;
+
+        let sfx = Sfx {
             live: true,
-            // Insisting on a dead device still insists — but the title screen
-            // says so instead of claiming sound that is not coming.
-            status: if dead {
-                "audio: forced on — device is dead".to_string()
-            } else {
-                "audio: on".to_string()
-            },
-            music_normal: None,
-            music_flight: None,
-            step_l: None,
-            step_r: None,
+            status: "audio: on".to_string(),
+            music_normal,
+            music_flight,
+            step_l,
+            step_r,
             flight_fade: 0.0,
             flying_now: false,
         };
-        sfx.music_normal = load(&render_music_wav(seed, false)).await;
-        sfx.music_flight = load(&render_music_wav(seed, true)).await;
-        sfx.step_l = load(&render_step_wav(-0.4)).await;
-        sfx.step_r = load(&render_step_wav(0.4)).await;
-        if let Some(s) = &sfx.music_normal {
-            audio::play_sound(
-                s,
-                audio::PlaySoundParams {
-                    looped: true,
-                    volume: 1.0,
-                },
-            );
+        // Again: the thread can die in the gap between any two of these calls.
+        if sfx.talkable() {
+            if let Some(s) = &sfx.music_normal {
+                audio::play_sound(
+                    s,
+                    audio::PlaySoundParams {
+                        looped: true,
+                        volume: 1.0,
+                    },
+                );
+            }
         }
         sfx
     }
@@ -167,8 +194,18 @@ impl Sfx {
         &self.status
     }
 
+    /// Whether it is still worth calling into the audio API. Once the mixer
+    /// thread is gone, every call buys another line of `Audio thread died` —
+    /// including a thread that outlived startup and died later, mid-game.
+    fn talkable(&self) -> bool {
+        self.live && !died()
+    }
+
     /// One footstep, panned left/right.
     pub fn footstep(&mut self, pan: f32) {
+        if !self.talkable() {
+            return;
+        }
         let slot = if pan < 0.0 { &self.step_l } else { &self.step_r };
         if let Some(s) = slot {
             audio::play_sound(
@@ -183,7 +220,7 @@ impl Sfx {
 
     /// Crossfade normal muzak into the brighter flight theme.
     pub fn update(&mut self, flying: bool, dt: f32) {
-        if !self.live {
+        if !self.talkable() {
             return;
         }
         if flying && !self.flying_now {
@@ -210,7 +247,16 @@ impl Sfx {
     }
 }
 
+/// Decode a sound — unless the mixer thread is already known to be gone.
+///
+/// The guard belongs here and not at each call site because this is the one
+/// place that hands data to quad-snd's thread, and every send to a corpse prints
+/// `Audio thread died` from inside the dependency. The thread can die between any
+/// two of the loads in [`Sfx::boot`], so the check has to be per-send.
 async fn load(bytes: &[u8]) -> Option<Sound> {
+    if died() {
+        return None;
+    }
     audio::load_sound_from_bytes(bytes).await.ok()
 }
 
