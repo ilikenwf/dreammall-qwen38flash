@@ -145,6 +145,16 @@ fn seed_from(args: &[String]) -> u64 {
 
 async fn amain() {
     let args: Vec<String> = std::env::args().collect();
+
+    // `--audio-check`: open the device, describe what happened, leave. Every
+    // line it prints is a question that would otherwise be asked over chat, and
+    // it forces the attempt so a machine that gave up earlier still answers.
+    if args.iter().any(|a| a == "--audio-check") {
+        Sfx::boot(sound::AudioWanted::Forced, seed_from(&args)).await;
+        println!("{}", sound::report());
+        return;
+    }
+
     let smoke = args.iter().any(|a| a == "--smoke");
     let shot: Option<String> = args
         .iter()

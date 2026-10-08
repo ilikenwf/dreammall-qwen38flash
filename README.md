@@ -107,14 +107,44 @@ does not compile on stable, so the game does not try.
 | Switch | Effect |
 | --- | --- |
 | `--no-audio` or `DREAMMALL_AUDIO=0` | force silence |
-| `DREAMMALL_AUDIO=1` | play anyway, even if the audio thread died — the title screen then reads `audio: forced on — device is dead`, and ALSA prints why |
+| `DREAMMALL_AUDIO=1` | play anyway, even if the audio thread died — the title screen then reads `audio: forced on — <reason>` |
 | `DREAMMALL_AUDIO_VERBOSE=1` | keep quad-snd's real panic report, for debugging audio |
+| `--audio-check` | open the device, print the whole diagnosis, exit |
 
 Linux needs `libasound` at runtime (already a dependency of the audio backend).
 
 ## No sound?
 
-The bottom-left of the title screen says which branch it took:
+Start here. One command, one pasteable block, nothing to interpret:
+
+```sh
+./target/release/dreammall --audio-check
+```
+
+```text
+quad-snd: Can't open PCM device. (alsa_snd.rs:30)
+title screen: audio: no output device — playing silent
+$ aplay -l
+aplay: device_list:277: no sound cards found (-5)
+$ aplay -L
+default
+… 41 more
+~/.asoundrc: absent
+/etc/asound.conf: absent
+$DREAMMALL_AUDIO: unset
+$DREAMMALL_AUDIO_VERBOSE: unset
+$ALSA_CARD: unset
+$DISPLAY: :1
+DREAMMALL_AUDIO_VERBOSE=1 --audio-check also prints the panic and backtrace.
+```
+
+It forces the attempt — so a machine that gave up earlier still answers — then
+prints what quad-snd said, what ALSA believes exists, and which config files and
+environment variables are in play. That block is the thing to paste into a bug
+report; on a working device the first two lines read `no failure recorded` and
+`audio: on`.
+
+The bottom-left of the title screen says which branch a normal launch took:
 
 | Title screen | Meaning |
 | --- | --- |

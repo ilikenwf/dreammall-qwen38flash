@@ -390,6 +390,76 @@ fn wav_bytes(pcm: &[u8], rate: u32, channels: u16) -> Vec<u8> {
     w
 }
 
+/// The whole audio path, described, for `--audio-check`.
+///
+/// One pasteable block: what quad-snd actually said, and what ALSA believes
+/// exists. The title screen's one-line reason is only half the story — the other
+/// half is whether `default` resolves to anything at all, and only the machine
+/// running the game knows that. Reads the same process-global state the mixer
+/// does, which is why this is a free function and not a method on a sound handle.
+pub fn report() -> String {
+    let mut out = String::new();
+    match failure() {
+        Some(why) => out.push_str(&format!("quad-snd: {why}\n")),
+        None => out.push_str("quad-snd: no failure recorded\n"),
+    }
+    // What a *normal* launch would say; the check itself forces the attempt, so
+    // the status it leaves behind is the insisting variant.
+    let verdict = if died() {
+        audio_status(false)
+    } else {
+        "audio: on".to_string()
+    };
+    out.push_str(&format!("title screen: {verdict}\n"));
+    out.push_str(&format!("$ aplay -l\n{}\n", probe("aplay", &["-l"])));
+    out.push_str(&format!("$ aplay -L\n{}\n", probe("aplay", &["-L"])));
+    let home = std::env::var("HOME").unwrap_or_default();
+    for (label, path) in [
+        ("~/.asoundrc", format!("{home}/.asoundrc")),
+        ("/etc/asound.conf", "/etc/asound.conf".to_string()),
+    ] {
+        out.push_str(&format!(
+            "{label}: {}\n",
+            if std::path::Path::new(&path).exists() {
+                "present"
+            } else {
+                "absent"
+            }
+        ));
+    }
+    for name in ["DREAMMALL_AUDIO", "DREAMMALL_AUDIO_VERBOSE", "ALSA_CARD", "DISPLAY"] {
+        out.push_str(&format!(
+            "${name}: {}\n",
+            std::env::var(name).unwrap_or_else(|_| "unset".to_string())
+        ));
+    }
+    out.push_str("DREAMMALL_AUDIO_VERBOSE=1 --audio-check also prints the panic and backtrace.");
+    out
+}
+
+/// Runs a diagnostic command and keeps its first lines. A missing binary is an
+/// answer rather than an error: no `aplay` says something about the box. ALSA
+/// reports "no sound cards found" on stderr, so an empty stdout falls back.
+fn probe(cmd: &str, args: &[&str]) -> String {
+    let Ok(out) = std::process::Command::new(cmd).args(args).output() else {
+        return format!("(no {cmd} on PATH)");
+    };
+    let bytes = if out.stdout.is_empty() { &out.stderr } else { &out.stdout };
+    let text = String::from_utf8_lossy(bytes);
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    if lines.is_empty() {
+        return "(no output)".to_string();
+    }
+    let kept = lines.iter().take(14).copied().collect::<Vec<_>>().join("\n");
+    match lines.len().checked_sub(14) {
+        Some(rest) => format!("{kept}\n… {rest} more"),
+        None => kept,
+    }
+}
+
 /// How long the soundtrack loop is, in seconds. Both the in-game loop and
 /// `--music` use this, so the number in the help text cannot drift.
 pub const MUSIC_SECONDS: usize = 64;
